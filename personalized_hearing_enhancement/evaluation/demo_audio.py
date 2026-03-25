@@ -6,6 +6,7 @@ import torch
 import typer
 from omegaconf import OmegaConf
 
+from personalized_hearing_enhancement.audiometry.profiles import resolve_audiogram_tensor
 from personalized_hearing_enhancement.evaluation.metrics import (
     bandwise_energy,
     gain_stats,
@@ -52,6 +53,7 @@ def run_demo_audio(
     device_profile: str = "headphones",
     max_gain_db: float = 20.0,
     debug: bool = False,
+    profile_json: str | None = None,
 ) -> Path:
     cfg = OmegaConf.load(config)
     set_global_seed(int(cfg.seed))
@@ -61,7 +63,8 @@ def run_demo_audio(
     logger = build_logger(out, name=f"phe_demo_{run_name}")
 
     original = normalize_audio(load_audio(input_wav, sr))
-    ag = torch.tensor([float(x) for x in audiogram.split(",")], dtype=torch.float32).unsqueeze(0)
+    ag, audiogram_source = resolve_audiogram_tensor(profile_json, audiogram, logger=logger)
+    logger.info(f"Using audiogram source: {audiogram_source}")
     impaired = apply_hearing_loss(original.unsqueeze(0), ag, sr=sr).squeeze(0)
 
     profile_name, _, profile_warning = resolve_device_profile(device_profile, debug=debug)
@@ -167,6 +170,7 @@ def main(
     device_profile: str = "headphones",
     max_gain_db: float = 20.0,
     debug: bool = False,
+    profile_json: str | None = None,
 ) -> None:
     run_demo_audio(
         input_wav,
@@ -180,6 +184,7 @@ def main(
         device_profile=device_profile,
         max_gain_db=max_gain_db,
         debug=debug,
+        profile_json=profile_json,
     )
 
 
