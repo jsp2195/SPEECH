@@ -11,7 +11,7 @@ from personalized_hearing_enhancement.audiometry.profiles import (
     load_profile,
     parse_manual_audiogram,
     print_profile_summary,
-    resolve_audiogram_tensor,
+    resolve_profile_input,
     save_profile,
     save_profile_plot,
 )
@@ -110,7 +110,7 @@ def demo_audio(
     config: str = "personalized_hearing_enhancement/configs/default.yaml",
     baseline_ckpt: str = "outputs/checkpoints/baseline_best.pt",
     conditioned_ckpt: str = "outputs/checkpoints/conditioned_best.pt",
-    audiogram: str = "20,25,30,45,60,65,70,75",
+    audiogram: str | None = typer.Option(None, help="8 comma-separated dB losses (manual fallback)"),
     profile_json: str | None = typer.Option(None, "--profile_json", help="Path to saved hearing profile JSON"),
     run_name: str = "demo_audio",
     mode: str = typer.Option("model", "--mode", help="model or calibration"),
@@ -118,27 +118,38 @@ def demo_audio(
     max_gain_db: float = typer.Option(20.0, "--max_gain_db"),
     debug: bool = typer.Option(False, "--debug"),
 ) -> None:
-    _get_cfg(config)
+    cfg = _get_cfg(config)
+    logger = build_logger(Path(cfg.paths.outputs) / run_name, name=f"phe_demo_cli_{run_name}")
+    profile, source = resolve_profile_input(
+        profile_json,
+        audiogram,
+        logger=logger,
+        sample_rate=int(cfg.sample_rate),
+        default_device_profile=device_profile,
+    )
+    logger.info(f"Resolved profile input path: {source}")
+    logger.info(f"Device profile source: {profile.device_profile or 'cli/default'}")
     run_demo_audio(
         input_wav,
         config,
         baseline_ckpt,
         conditioned_ckpt,
         audiogram,
-        "outputs",
+        str(cfg.paths.outputs),
         run_name,
         mode=mode,
         device_profile=device_profile,
         max_gain_db=max_gain_db,
         debug=debug,
         profile_json=profile_json,
+        profile=profile,
     )
 
 
 @app.command()
 def process_video(
     input: str = typer.Option(..., "--input", help="Input MP4"),
-    audiogram: str = typer.Option("20,25,30,45,60,65,70,75", help="8 comma-separated dB losses"),
+    audiogram: str | None = typer.Option(None, help="8 comma-separated dB losses (manual fallback)"),
     profile_json: str | None = typer.Option(None, "--profile_json", help="Path to saved hearing profile JSON"),
     config: str = "personalized_hearing_enhancement/configs/default.yaml",
     baseline_ckpt: str = "outputs/checkpoints/baseline_best.pt",
@@ -150,17 +161,27 @@ def process_video(
 ) -> None:
     cfg = _get_cfg(config)
     logger = build_logger(Path(cfg.paths.outputs) / run_name, name=f"phe_video_{run_name}")
-    ag, source = resolve_audiogram_tensor(profile_json, audiogram, logger=logger)
-    logger.info(f"Using audiogram source: {source}")
+    profile, source = resolve_profile_input(
+        profile_json,
+        audiogram,
+        logger=logger,
+        sample_rate=int(cfg.sample_rate),
+        default_device_profile=device_profile,
+    )
+    logger.info(f"Resolved profile input path: {source}")
+    logger.info(f"Device profile source: {profile.device_profile or 'cli/default'}")
+
     out_path = create_comparison_video(
         original_mp4=input,
         output_dir=Path(cfg.paths.outputs) / run_name,
         baseline_ckpt=baseline_ckpt,
         conditioned_ckpt=conditioned_ckpt,
-        audiogram=ag,
+        audiogram=profile.to_tensor(),
         config_path=config,
         device_profile=device_profile,
         max_gain_db=max_gain_db,
+        profile_json=profile_json,
+        profile=profile,
     )
     if debug:
         logger.info(f"Debug mode enabled; output={out_path}")
@@ -195,7 +216,7 @@ def debug(config: str = "personalized_hearing_enhancement/configs/default.yaml")
         config,
         "outputs/checkpoints/baseline_best.pt",
         "outputs/checkpoints/conditioned_best.pt",
-        "20,25,30,45,60,65,70,75",
+        None,
         "outputs",
         cfg.debug.run_name,
         mode="model",
@@ -203,6 +224,7 @@ def debug(config: str = "personalized_hearing_enhancement/configs/default.yaml")
         max_gain_db=20.0,
         debug=True,
         profile_json=str(profile_path),
+        profile=sample_profile,
     )
     logger.info("Debug pipeline complete.")
 
