@@ -1,0 +1,68 @@
+seed: 42
+sample_rate: 16000
+segment_seconds:
+  min: 2.0
+  max: 5.0
+
+paths:
+  data_cache: ./data_cache
+  outputs: ./outputs
+  checkpoints: ./outputs/checkpoints
+
+training:
+  batch_size: 4
+  num_workers: 2
+  epochs: 3
+  steps_per_epoch: 200
+  val_steps: 40
+  lr: 0.0005
+  weight_decay: 0.0001
+  warmup_steps: 200
+  grad_clip: 5.0
+
+curriculum:
+  enabled: true
+  phase1:
+    epochs: 1
+    hearing_loss: false
+    conditioned: false
+  phase2:
+    epochs: 2
+    hearing_loss: true
+    conditioned: true
+
+dataset:
+  librispeech_subset: train-clean-100
+  librispeech_val_subset: dev-clean
+  snr_min_db: 0.0
+  snr_max_db: 20.0
+
+model:
+  tasnet:
+    encoder_dim: 192
+    feature_dim: 96
+    hidden_dim: 384
+    kernel_size: 16
+    tcn_layers: 8
+    tcn_stacks: 3
+    bottleneck_dim: 128
+
+audiogram:
+  freqs_hz: [250, 500, 1000, 2000, 4000, 6000, 8000, 9000]
+  presets:
+    mild: [10, 12, 15, 20, 25, 25, 30, 30]
+    moderate: [20, 25, 30, 40, 50, 55, 60, 60]
+    severe: [35, 40, 50, 65, 75, 80, 85, 85]
+    sloping: [5, 8, 12, 25, 45, 55, 65, 70]
+
+debug:
+  max_samples: 10
+  train_steps: 8
+  val_steps: 2
+  run_name: debug_run
+
+video:
+  codec_video: libx264
+  codec_audio: aac
+  crf: 20
+  preset: medium
