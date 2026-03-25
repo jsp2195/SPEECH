@@ -28,3 +28,6 @@ hearing-enhance = "personalized_hearing_enhancement.cli.main:app"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["personalized_hearing_enhancement*"]
+
+[tool.setuptools.package-data]
+"personalized_hearing_enhancement.simulation" = ["device_profiles.json"]
