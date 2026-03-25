@@ -7,6 +7,7 @@ import torch
 
 from personalized_hearing_enhancement.data.augment import mix_snr
 from personalized_hearing_enhancement.models.tasnet import ConvTasNet
+from personalized_hearing_enhancement.simulation.calibration_filter import apply_calibration_filter
 from personalized_hearing_enhancement.utils.repro import set_global_seed
 
 
@@ -49,3 +50,15 @@ def test_numpy_and_torch_seed_sync() -> None:
 
     assert np.allclose(a1, a2)
     assert torch.allclose(t1, t2)
+
+
+def test_calibration_filter_determinism() -> None:
+    set_global_seed(101)
+    x = torch.randn(16000)
+    audiogram = torch.tensor([[20.0, 25.0, 30.0, 45.0, 60.0, 65.0, 70.0, 75.0]])
+    y1 = apply_calibration_filter(x, audiogram, sample_rate=16000, device_profile="headphones", max_gain_db=20.0)
+
+    set_global_seed(101)
+    y2 = apply_calibration_filter(x, audiogram, sample_rate=16000, device_profile="headphones", max_gain_db=20.0)
+
+    assert torch.allclose(y1, y2, atol=1e-6)

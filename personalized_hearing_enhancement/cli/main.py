@@ -59,9 +59,25 @@ def demo_audio(
     conditioned_ckpt: str = "outputs/checkpoints/conditioned_best.pt",
     audiogram: str = "20,25,30,45,60,65,70,75",
     run_name: str = "demo_audio",
+    mode: str = typer.Option("model", "--mode", help="model or calibration"),
+    device_profile: str = typer.Option("headphones", "--device_profile", help="earbuds|headphones|airpods|overear"),
+    max_gain_db: float = typer.Option(20.0, "--max_gain_db"),
+    debug: bool = typer.Option(False, "--debug"),
 ) -> None:
     _get_cfg(config)
-    run_demo_audio(input_wav, config, baseline_ckpt, conditioned_ckpt, audiogram, "outputs", run_name)
+    run_demo_audio(
+        input_wav,
+        config,
+        baseline_ckpt,
+        conditioned_ckpt,
+        audiogram,
+        "outputs",
+        run_name,
+        mode=mode,
+        device_profile=device_profile,
+        max_gain_db=max_gain_db,
+        debug=debug,
+    )
 
 
 @app.command()
@@ -72,6 +88,9 @@ def process_video(
     baseline_ckpt: str = "outputs/checkpoints/baseline_best.pt",
     conditioned_ckpt: str = "outputs/checkpoints/conditioned_best.pt",
     run_name: str = "video",
+    device_profile: str = typer.Option("headphones", "--device_profile", help="earbuds|headphones|airpods|overear"),
+    max_gain_db: float = typer.Option(20.0, "--max_gain_db"),
+    debug: bool = typer.Option(False, "--debug"),
 ) -> None:
     cfg = _get_cfg(config)
     logger = build_logger(Path(cfg.paths.outputs) / run_name, name=f"phe_video_{run_name}")
@@ -83,7 +102,11 @@ def process_video(
         conditioned_ckpt=conditioned_ckpt,
         audiogram=ag,
         config_path=config,
+        device_profile=device_profile,
+        max_gain_db=max_gain_db,
     )
+    if debug:
+        logger.info(f"Debug mode enabled; output={out_path}")
     logger.info(f"Saved comparison video to {out_path}")
 
 
@@ -103,6 +126,10 @@ def debug(config: str = "personalized_hearing_enhancement/configs/default.yaml")
         "20,25,30,45,60,65,70,75",
         "outputs",
         cfg.debug.run_name,
+        mode="model",
+        device_profile="headphones",
+        max_gain_db=20.0,
+        debug=True,
     )
     logger.info("Debug pipeline complete.")
 

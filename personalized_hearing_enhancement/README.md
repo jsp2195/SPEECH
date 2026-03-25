@@ -65,16 +65,24 @@ Outputs in `outputs/demo1/`:
 - `clean.wav`
 - `degraded.wav`
 - `baseline.wav`
+- `calibration.wav`
 - `conditioned.wav`
+- `output.wav` (selected with `--mode`)
 - `waveforms.png`
 - `spectrograms.png`
 - `metrics.json`
+
+Additional flags:
+- `--mode {model,calibration}`
+- `--device_profile {earbuds,headphones,airpods,overear}`
+- `--max_gain_db 20`
+- `--debug`
 
 ## Process Video
 ```bash
 python -m personalized_hearing_enhancement.cli.main process-video --input sample.mp4 --audiogram "20,25,30,45,60,65,70,75" --run-name video1
 ```
-Outputs include `comparison_grid.mp4` plus per-condition audio files.
+Outputs include `comparison_grid.mp4` plus labeled audio/video variants for original, hearing-impaired, baseline, calibration-filter, and ML model output.
 
 ## Curriculum Training
 Two-stage curriculum configured in `configs/default.yaml`:
