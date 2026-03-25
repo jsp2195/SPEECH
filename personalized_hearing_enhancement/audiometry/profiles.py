@@ -5,6 +5,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import torch
@@ -23,6 +24,27 @@ class HearingProfile:
     source: str = "estimated"
     sample_rate: int | None = None
     metadata: dict[str, str | int | float | bool] = field(default_factory=dict)
+
+    def to_tensor(self, *, batch_dim: bool = True, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        validate_profile(self)
+        values = torch.tensor(self.thresholds_db, dtype=dtype)
+        return values.unsqueeze(0) if batch_dim else values
+
+    def get_device_profile(self, fallback: str | None = None) -> str | None:
+        return self.device_profile or fallback
+
+    def profile_summary(self) -> str:
+        pairs = ", ".join(f"{f}Hz:{t:.1f}dB" for f, t in zip(self.frequencies, self.thresholds_db, strict=True))
+        return (
+            f"Profile source={self.source}, timestamp={self.timestamp_utc}\n"
+            f"Device profile={self.device_profile or 'N/A'}\n"
+            f"Thresholds: {pairs}"
+        )
+
+    def as_metadata(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["threshold_tensor"] = self.to_tensor().squeeze(0).tolist()
+        return payload
 
 
 def validate_profile(profile: HearingProfile) -> None:
@@ -55,11 +77,6 @@ def load_profile(path: str | Path) -> HearingProfile:
     return profile
 
 
-def audiogram_tensor_from_profile(profile: HearingProfile) -> torch.Tensor:
-    validate_profile(profile)
-    return torch.tensor([profile.thresholds_db], dtype=torch.float32)
-
-
 def parse_manual_audiogram(audiogram: str) -> list[float]:
     values = [float(x.strip()) for x in audiogram.split(",") if x.strip()]
     if len(values) != len(STANDARD_FREQS_HZ):
@@ -69,31 +86,68 @@ def parse_manual_audiogram(audiogram: str) -> list[float]:
     return values
 
 
+def create_manual_profile(
+    manual_audiogram: str,
+    *,
+    device_profile: str | None = None,
+    sample_rate: int | None = None,
+    source: str = "manual",
+    notes: str = "",
+) -> HearingProfile:
+    profile = HearingProfile(
+        frequencies=list(STANDARD_FREQS_HZ),
+        thresholds_db=parse_manual_audiogram(manual_audiogram),
+        device_profile=device_profile,
+        source=source,
+        sample_rate=sample_rate,
+        notes=notes,
+    )
+    validate_profile(profile)
+    return profile
+
+
+def resolve_profile_input(
+    profile_json: str | None,
+    manual_audiogram: str | None,
+    *,
+    logger=None,
+    sample_rate: int | None = None,
+    default_device_profile: str | None = None,
+) -> tuple[HearingProfile, str]:
+    if profile_json:
+        profile = load_profile(profile_json)
+        if manual_audiogram and logger is not None:
+            logger.warning("Both --profile-json and --audiogram were provided; --profile-json takes precedence.")
+        return profile, f"profile_json:{profile_json}"
+
+    if manual_audiogram is None:
+        raise ValueError("Either profile_json or manual_audiogram must be provided")
+
+    profile = create_manual_profile(
+        manual_audiogram,
+        sample_rate=sample_rate,
+        device_profile=default_device_profile,
+        source="manual_cli",
+    )
+    return profile, "manual"
+
+
+def audiogram_tensor_from_profile(profile: HearingProfile) -> torch.Tensor:
+    return profile.to_tensor()
+
+
 def resolve_audiogram_tensor(
     profile_json: str | None,
     manual_audiogram: str | None,
     *,
     logger=None,
 ) -> tuple[torch.Tensor, str]:
-    if profile_json:
-        profile = load_profile(profile_json)
-        if manual_audiogram and logger is not None:
-            logger.warning("Both --profile-json and --audiogram were provided; --profile-json takes precedence.")
-        return audiogram_tensor_from_profile(profile), f"profile_json:{profile_json}"
-
-    if manual_audiogram is None:
-        raise ValueError("Either profile_json or manual_audiogram must be provided")
-    values = parse_manual_audiogram(manual_audiogram)
-    return torch.tensor([values], dtype=torch.float32), "manual"
+    profile, source = resolve_profile_input(profile_json, manual_audiogram, logger=logger)
+    return profile.to_tensor(), source
 
 
 def print_profile_summary(profile: HearingProfile) -> str:
-    pairs = ", ".join(f"{f}Hz:{t:.1f}dB" for f, t in zip(profile.frequencies, profile.thresholds_db, strict=True))
-    return (
-        f"Profile source={profile.source}, timestamp={profile.timestamp_utc}\n"
-        f"Device profile={profile.device_profile or 'N/A'}\n"
-        f"Thresholds: {pairs}"
-    )
+    return profile.profile_summary()
 
 
 def save_profile_plot(profile: HearingProfile, output_path: str | Path) -> Path:

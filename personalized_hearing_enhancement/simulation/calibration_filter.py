@@ -7,6 +7,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from personalized_hearing_enhancement.audiometry.profiles import HearingProfile
 from personalized_hearing_enhancement.simulation.hearing_loss import AUDIOGRAM_FREQS
 
 
@@ -155,6 +159,44 @@ def build_calibration_filter(
         fft_size=fft_size,
         hop_size=fft_size // 2,
         window=torch.hann_window(fft_size, periodic=False),
+    )
+
+
+
+
+def build_calibration_from_profile(
+    profile: "HearingProfile",
+    sample_rate: int = 16000,
+    device_profile: str | None = None,
+    max_gain_db: float = 20.0,
+    fft_size: int = 1024,
+) -> CalibrationFilter:
+    selected_device_profile = device_profile or profile.get_device_profile("headphones") or "headphones"
+    return build_calibration_filter(
+        audiogram=profile.to_tensor(),
+        sample_rate=sample_rate,
+        device_profile=selected_device_profile,
+        max_gain_db=max_gain_db,
+        fft_size=fft_size,
+    )
+
+
+def apply_profile_calibration(
+    waveform: torch.Tensor,
+    profile: "HearingProfile",
+    sample_rate: int = 16000,
+    device_profile: str | None = None,
+    max_gain_db: float = 20.0,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    selected_device_profile = device_profile or profile.get_device_profile("headphones") or "headphones"
+    return apply_calibration_filter(
+        waveform=waveform,
+        audiogram=profile.to_tensor(),
+        sample_rate=sample_rate,
+        device_profile=selected_device_profile,
+        max_gain_db=max_gain_db,
+        chunk_size=chunk_size,
     )
 
 
