@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+
+from personalized_hearing_enhancement.audiometry.stimuli import STANDARD_FREQS_HZ
+
+
+@dataclass
+class FrequencyState:
+    frequency_hz: int
+    current_db_hl: float
+    step_size_db: float
+    reversals: int = 0
+    max_trials_reached: bool = False
+    complete: bool = False
+    threshold_estimate_db_hl: float | None = None
+    uncertainty_db: float | None = None
+    trials: list[dict[str, float | bool]] = field(default_factory=list)
+
+
+@dataclass
+class AudiometrySession:
+    frequencies_hz: list[int] = field(default_factory=lambda: list(STANDARD_FREQS_HZ))
+    start_amplitude_db_hl: float = 40.0
+    initial_step_size_db: float = 10.0
+    min_step_size_db: float = 2.0
+    max_trials_per_frequency: int = 18
+    max_reversals: int = 4
+    seed: int | None = None
+    source: str = "interactive"
+    session_started_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    active_frequency_index: int = 0
+    frequencies: dict[int, FrequencyState] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.frequencies:
+            self.frequencies = {
+                f: FrequencyState(
+                    frequency_hz=f,
+                    current_db_hl=float(self.start_amplitude_db_hl),
+                    step_size_db=float(self.initial_step_size_db),
+                )
+                for f in self.frequencies_hz
+            }
+
+    @property
+    def active_frequency_hz(self) -> int:
+        return self.frequencies_hz[self.active_frequency_index]
+
+    def state_for(self, frequency_hz: int) -> FrequencyState:
+        return self.frequencies[frequency_hz]
+
+    def is_complete(self) -> bool:
+        return all(state.complete for state in self.frequencies.values())
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        payload["frequencies"] = {str(k): v for k, v in payload["frequencies"].items()}
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "AudiometrySession":
+        payload = dict(payload)
+        raw_freq = payload.get("frequencies", {})
+        payload["frequencies"] = {int(k): FrequencyState(**v) for k, v in raw_freq.items()}
+        return cls(**payload)
