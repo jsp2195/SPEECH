@@ -9,7 +9,12 @@ import torch
 from typer.testing import CliRunner
 
 from personalized_hearing_enhancement.audiometry.engine import AudiometryEngineConfig, run_hearing_test
-from personalized_hearing_enhancement.audiometry.profiles import HearingProfile, load_profile, save_profile
+from personalized_hearing_enhancement.audiometry.profiles import (
+    HearingProfile,
+    load_profile,
+    resolve_profile_input,
+    save_profile,
+)
 from personalized_hearing_enhancement.audiometry.stimuli import generate_tone_probe
 from personalized_hearing_enhancement.cli.main import app
 
@@ -92,3 +97,25 @@ def test_profile_json_precedence_over_manual_audiogram(tmp_path: Path) -> None:
     tensor, source = resolve_audiogram_tensor(str(profile_path), "20,25,30,45,60,65,70,75")
     assert source.startswith("profile_json")
     assert torch.allclose(tensor, torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.float32))
+
+
+def test_resolve_profile_input_prefers_profile_json(tmp_path: Path) -> None:
+    profile = HearingProfile(
+        frequencies=[250, 500, 1000, 2000, 3000, 4000, 6000, 8000],
+        thresholds_db=[10, 11, 12, 13, 14, 15, 16, 17],
+        source="simulated",
+    )
+    path = tmp_path / "profile.json"
+    save_profile(profile, path)
+
+    resolved, source = resolve_profile_input(str(path), "1,1,1,1,1,1,1,1")
+    assert source.startswith("profile_json")
+    assert resolved.thresholds_db == profile.thresholds_db
+
+
+def test_profile_tensor_roundtrip_and_manual_path() -> None:
+    resolved, source = resolve_profile_input(None, "20,25,30,45,60,65,70,75")
+    assert source == "manual"
+    tensor = resolved.to_tensor()
+    assert tensor.shape == (1, 8)
+    assert torch.allclose(tensor, torch.tensor([[20, 25, 30, 45, 60, 65, 70, 75]], dtype=torch.float32))

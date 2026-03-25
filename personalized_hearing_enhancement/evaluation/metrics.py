@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 
 from personalized_hearing_enhancement.simulation.hearing_loss import apply_hearing_loss
@@ -63,6 +65,21 @@ def high_frequency_energy_ratio(reference: torch.Tensor, estimate: torch.Tensor,
     return float((e_energy / r_energy).item())
 
 
+def hf_restoration_metrics(
+    reference: torch.Tensor,
+    estimate: torch.Tensor,
+    impaired: torch.Tensor,
+    sr: int,
+    threshold_hz: int = 3000,
+) -> dict[str, float]:
+    estimate_ratio = high_frequency_energy_ratio(reference, estimate, sr=sr, threshold_hz=threshold_hz)
+    impaired_ratio = high_frequency_energy_ratio(reference, impaired, sr=sr, threshold_hz=threshold_hz)
+    return {
+        "hf_energy_ratio": float(estimate_ratio),
+        "hf_improvement_vs_impaired": float(estimate_ratio - impaired_ratio),
+    }
+
+
 def intelligibility_proxy(reference: torch.Tensor, estimate: torch.Tensor) -> float:
     if reference.ndim == 2:
         reference = reference.squeeze(0)
@@ -82,6 +99,26 @@ def gain_stats(input_signal: torch.Tensor, output_signal: torch.Tensor) -> dict[
         "input_rms": float(in_rms.item()),
         "output_rms": float(out_rms.item()),
         "gain_db": float(gain_db.item()),
+    }
+
+
+def safety_metrics(reference: torch.Tensor, estimate: torch.Tensor) -> dict[str, float]:
+    if estimate.ndim == 2:
+        estimate = estimate.squeeze(0)
+    if reference.ndim == 2:
+        reference = reference.squeeze(0)
+    abs_est = torch.abs(estimate)
+    clipping_fraction = float((abs_est >= 0.999).float().mean().item())
+    peak_linear = float(abs_est.max().item())
+    peak_dbfs = float(20.0 * math.log10(max(peak_linear, 1e-8)))
+    rms = float(torch.sqrt(torch.mean(estimate**2) + 1e-8).item())
+    ref_rms = float(torch.sqrt(torch.mean(reference**2) + 1e-8).item())
+    loudness_delta_db = float(20.0 * math.log10((rms + 1e-8) / (ref_rms + 1e-8)))
+    return {
+        "safety_clipping_fraction": clipping_fraction,
+        "safety_peak_dbfs": peak_dbfs,
+        "safety_rms": rms,
+        "safety_loudness_delta_db": loudness_delta_db,
     }
 
 
@@ -109,11 +146,6 @@ def listener_space_metrics(
     *,
     output_already_impaired: bool = False,
 ) -> dict[str, float]:
-    """Compare H(original, θ) vs H(output, θ) in listener space.
-
-    If `output_already_impaired` is True, output is treated as H(original, θ)-domain already
-    and will not be passed through H again.
-    """
     if original.ndim == 1:
         original = original.unsqueeze(0)
     if output.ndim == 1:
@@ -127,4 +159,75 @@ def listener_space_metrics(
     return {
         "listener_space_si_sdr": float(si_sdr(heard_original, heard_output).mean().item()),
         "listener_space_spectral_distance": log_spectral_distance(heard_original, heard_output),
+    }
+
+
+def three_way_user_benefit_metrics(
+    original: torch.Tensor,
+    impaired: torch.Tensor,
+    calibration: torch.Tensor,
+    conditioned: torch.Tensor,
+    audiogram: torch.Tensor,
+    sr: int,
+) -> dict[str, dict]:
+    signal_space = {
+        "impaired": {
+            "signal_space_si_sdr": float(si_sdr(original, impaired).mean().item()),
+            "signal_space_spectral_distance": log_spectral_distance(original, impaired),
+        },
+        "calibration": {
+            "signal_space_si_sdr": float(si_sdr(original, calibration).mean().item()),
+            "signal_space_spectral_distance": log_spectral_distance(original, calibration),
+        },
+        "conditioned": {
+            "signal_space_si_sdr": float(si_sdr(original, conditioned).mean().item()),
+            "signal_space_spectral_distance": log_spectral_distance(original, conditioned),
+        },
+    }
+
+    listener_space = {
+        "impaired": listener_space_metrics(original, impaired, audiogram, sr=sr, output_already_impaired=True),
+        "calibration": listener_space_metrics(original, calibration, audiogram, sr=sr),
+        "conditioned": listener_space_metrics(original, conditioned, audiogram, sr=sr),
+    }
+
+    hf = {
+        "impaired": hf_restoration_metrics(original, impaired, impaired, sr=sr),
+        "calibration": hf_restoration_metrics(original, calibration, impaired, sr=sr),
+        "conditioned": hf_restoration_metrics(original, conditioned, impaired, sr=sr),
+    }
+
+    safety = {
+        "impaired": safety_metrics(original, impaired),
+        "calibration": safety_metrics(original, calibration),
+        "conditioned": safety_metrics(original, conditioned),
+    }
+
+    comparison = {
+        "question": "Does conditioned ML improve on calibration baseline in listener space?",
+        "conditioned_vs_calibration_listener_space_delta": {
+            "listener_space_si_sdr": listener_space["conditioned"]["listener_space_si_sdr"]
+            - listener_space["calibration"]["listener_space_si_sdr"],
+            "listener_space_spectral_distance": listener_space["conditioned"]["listener_space_spectral_distance"]
+            - listener_space["calibration"]["listener_space_spectral_distance"],
+        },
+        "conditioned_vs_calibration_hf_delta": {
+            "hf_energy_ratio": hf["conditioned"]["hf_energy_ratio"] - hf["calibration"]["hf_energy_ratio"],
+            "hf_improvement_vs_impaired": hf["conditioned"]["hf_improvement_vs_impaired"]
+            - hf["calibration"]["hf_improvement_vs_impaired"],
+        },
+        "conditioned_vs_calibration_safety_delta": {
+            "safety_clipping_fraction": safety["conditioned"]["safety_clipping_fraction"] - safety["calibration"]["safety_clipping_fraction"],
+            "safety_peak_dbfs": safety["conditioned"]["safety_peak_dbfs"] - safety["calibration"]["safety_peak_dbfs"],
+            "safety_loudness_delta_db": safety["conditioned"]["safety_loudness_delta_db"]
+            - safety["calibration"]["safety_loudness_delta_db"],
+        },
+    }
+
+    return {
+        "signal_space": signal_space,
+        "listener_space": listener_space,
+        "hf": hf,
+        "safety": safety,
+        "comparison": comparison,
     }

@@ -2,23 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 import typer
 from omegaconf import OmegaConf
 
-from personalized_hearing_enhancement.audiometry.profiles import resolve_audiogram_tensor
-from personalized_hearing_enhancement.evaluation.metrics import (
-    bandwise_energy,
-    gain_stats,
-    high_frequency_energy_ratio,
-    intelligibility_proxy,
-    listener_space_metrics,
-    log_spectral_distance,
-    si_sdr,
-)
+from personalized_hearing_enhancement.audiometry.profiles import HearingProfile, resolve_profile_input
+from personalized_hearing_enhancement.evaluation.metrics import bandwise_energy, gain_stats, three_way_user_benefit_metrics
 from personalized_hearing_enhancement.models.conditioned_tasnet import ConditionedConvTasNet
 from personalized_hearing_enhancement.models.tasnet import ConvTasNet
-from personalized_hearing_enhancement.simulation.calibration_filter import apply_calibration_filter, resolve_device_profile
+from personalized_hearing_enhancement.simulation.calibration_filter import apply_profile_calibration, resolve_device_profile
 from personalized_hearing_enhancement.simulation.hearing_loss import apply_hearing_loss
 from personalized_hearing_enhancement.simulation.loudness import clipping_stats, safe_post_amplification
 from personalized_hearing_enhancement.utils.audio import load_audio, normalize_audio, save_audio
@@ -41,12 +34,56 @@ def _load_model(kind: str, ckpt_path: Path, cfg, logger) -> torch.nn.Module:
     return model
 
 
+def _save_hf_plot(metrics: dict[str, dict], output: Path) -> None:
+    labels = ["impaired", "calibration", "conditioned"]
+    values = [metrics[label]["hf_energy_ratio"] for label in labels]
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.bar(labels, values, color=["#999999", "#1f77b4", "#2ca02c"])
+    ax.set_ylabel("HF energy ratio")
+    ax.set_title("High-frequency restoration comparison")
+    fig.tight_layout()
+    fig.savefig(output)
+    plt.close(fig)
+
+
+def _save_safety_plot(metrics: dict[str, dict], output: Path) -> None:
+    labels = ["impaired", "calibration", "conditioned"]
+    values = [metrics[label]["safety_clipping_fraction"] for label in labels]
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.bar(labels, values, color=["#999999", "#1f77b4", "#2ca02c"])
+    ax.set_ylabel("Clipping fraction")
+    ax.set_title("Safety summary (lower is better)")
+    fig.tight_layout()
+    fig.savefig(output)
+    plt.close(fig)
+
+
+def _human_summary(metrics: dict[str, dict]) -> str:
+    ls = metrics["listener_space"]
+    comp = metrics["comparison"]
+    return (
+        "Three-way user-benefit summary\n"
+        "1) impaired input: "
+        f"listener_si_sdr={ls['impaired']['listener_space_si_sdr']:.3f}, "
+        f"listener_spectral_distance={ls['impaired']['listener_space_spectral_distance']:.3f}\n"
+        "2) calibration baseline: "
+        f"listener_si_sdr={ls['calibration']['listener_space_si_sdr']:.3f}, "
+        f"listener_spectral_distance={ls['calibration']['listener_space_spectral_distance']:.3f}\n"
+        "3) conditioned ML: "
+        f"listener_si_sdr={ls['conditioned']['listener_space_si_sdr']:.3f}, "
+        f"listener_spectral_distance={ls['conditioned']['listener_space_spectral_distance']:.3f}\n"
+        "4) conditioned-vs-calibration: "
+        f"delta_listener_si_sdr={comp['conditioned_vs_calibration_listener_space_delta']['listener_space_si_sdr']:.3f}, "
+        f"delta_listener_spectral_distance={comp['conditioned_vs_calibration_listener_space_delta']['listener_space_spectral_distance']:.3f}"
+    )
+
+
 def run_demo_audio(
     input_wav: str,
     config: str,
     baseline_ckpt: str,
     conditioned_ckpt: str,
-    audiogram: str,
+    audiogram: str | None,
     output_dir: str,
     run_name: str,
     mode: str = "model",
@@ -54,6 +91,7 @@ def run_demo_audio(
     max_gain_db: float = 20.0,
     debug: bool = False,
     profile_json: str | None = None,
+    profile: HearingProfile | None = None,
 ) -> Path:
     cfg = OmegaConf.load(config)
     set_global_seed(int(cfg.seed))
@@ -62,18 +100,33 @@ def run_demo_audio(
     out = Path(output_dir) / run_name
     logger = build_logger(out, name=f"phe_demo_{run_name}")
 
-    original = normalize_audio(load_audio(input_wav, sr))
-    ag, audiogram_source = resolve_audiogram_tensor(profile_json, audiogram, logger=logger)
-    logger.info(f"Using audiogram source: {audiogram_source}")
-    impaired = apply_hearing_loss(original.unsqueeze(0), ag, sr=sr).squeeze(0)
+    if profile is None:
+        profile, profile_source = resolve_profile_input(
+            profile_json,
+            audiogram,
+            logger=logger,
+            sample_rate=sr,
+            default_device_profile=device_profile,
+        )
+    else:
+        profile_source = "provided_profile"
 
-    profile_name, _, profile_warning = resolve_device_profile(device_profile, debug=debug)
+    audiogram_tensor = profile.to_tensor()
+    logger.info(f"Using hearing profile source: {profile_source}")
+
+    selected_device_profile = device_profile
+    if profile.device_profile and device_profile == "headphones":
+        selected_device_profile = profile.device_profile
+    profile_name, _, profile_warning = resolve_device_profile(selected_device_profile, debug=debug)
     if profile_warning:
         logger.warning(profile_warning)
 
-    calibration = apply_calibration_filter(
+    original = normalize_audio(load_audio(input_wav, sr))
+    impaired = apply_hearing_loss(original.unsqueeze(0), audiogram_tensor, sr=sr).squeeze(0)
+
+    calibration = apply_profile_calibration(
         original,
-        ag,
+        profile,
         sample_rate=sr,
         device_profile=profile_name,
         max_gain_db=max_gain_db,
@@ -86,7 +139,7 @@ def run_demo_audio(
 
     with torch.no_grad():
         baseline_enh = baseline(original.unsqueeze(0)).squeeze(0)
-        conditioned_enh = conditioned(original.unsqueeze(0), ag).squeeze(0)
+        conditioned_enh = conditioned(original.unsqueeze(0), audiogram_tensor).squeeze(0)
 
     baseline_enh = safe_post_amplification(baseline_enh.unsqueeze(0), reference=original.unsqueeze(0)).squeeze(0)
     conditioned_enh = safe_post_amplification(conditioned_enh.unsqueeze(0), reference=original.unsqueeze(0)).squeeze(0)
@@ -95,7 +148,6 @@ def run_demo_audio(
 
     save_audio(out / "original.wav", original, sr)
     save_audio(out / "impaired.wav", impaired, sr)
-    # Backward-compatible file aliases
     save_audio(out / "clean.wav", original, sr)
     save_audio(out / "degraded.wav", impaired, sr)
     save_audio(out / "baseline.wav", baseline_enh, sr)
@@ -105,54 +157,44 @@ def run_demo_audio(
 
     waves = {
         "original": original,
-        "hearing-impaired": impaired,
-        "baseline": baseline_enh,
-        "calibration-filter": calibration,
-        "ml-model": conditioned_enh,
+        "impaired": impaired,
+        "calibration-baseline": calibration,
+        "conditioned-ml": conditioned_enh,
+        "baseline-model": baseline_enh,
     }
     save_waveform_plot(waves, out / "waveforms.png", sr=sr)
     save_spectrogram_plot(waves, out / "spectrograms.png", sr=sr)
 
-    signal_space_metrics: dict[str, float | dict[str, float] | str] = {
+    three_way_metrics = three_way_user_benefit_metrics(
+        original=original,
+        impaired=impaired,
+        calibration=calibration,
+        conditioned=conditioned_enh,
+        audiogram=audiogram_tensor,
+        sr=sr,
+    )
+    three_way_metrics["signal_space"]["baseline_model"] = {
+        "signal_space_band_energy": bandwise_energy(baseline_enh, sr=sr),
+        "signal_space_gain": gain_stats(original, baseline_enh),
+        "signal_space_clipping": clipping_stats(baseline_enh),
+    }
+
+    metric_rows = {
         "mode": mode,
+        "baseline_role": "calibration",
+        "challenger_role": "conditioned_ml",
         "device_profile": profile_name,
         "max_gain_db": max_gain_db,
-        "signal_space_impaired_si_sdr": si_sdr(original, impaired).mean().item(),
-        "signal_space_baseline_si_sdr": si_sdr(original, baseline_enh).mean().item(),
-        "signal_space_calibration_si_sdr": si_sdr(original, calibration).mean().item(),
-        "signal_space_conditioned_si_sdr": si_sdr(original, conditioned_enh).mean().item(),
-        "signal_space_impaired_spectral_distance": log_spectral_distance(original, impaired),
-        "signal_space_baseline_spectral_distance": log_spectral_distance(original, baseline_enh),
-        "signal_space_calibration_spectral_distance": log_spectral_distance(original, calibration),
-        "signal_space_conditioned_spectral_distance": log_spectral_distance(original, conditioned_enh),
-        "signal_space_impaired_hf_recovery": high_frequency_energy_ratio(original, impaired, sr=sr),
-        "signal_space_calibration_hf_recovery": high_frequency_energy_ratio(original, calibration, sr=sr),
-        "signal_space_conditioned_hf_recovery": high_frequency_energy_ratio(original, conditioned_enh, sr=sr),
-        "signal_space_impaired_intelligibility": intelligibility_proxy(original, impaired),
-        "signal_space_calibration_intelligibility": intelligibility_proxy(original, calibration),
-        "signal_space_conditioned_intelligibility": intelligibility_proxy(original, conditioned_enh),
-        "baseline_band_energy": bandwise_energy(baseline_enh, sr=sr),
-        "calibration_band_energy": bandwise_energy(calibration, sr=sr),
-        "conditioned_band_energy": bandwise_energy(conditioned_enh, sr=sr),
-        "calibration_gain": gain_stats(original, calibration),
-        "conditioned_gain": gain_stats(original, conditioned_enh),
-        "calibration_clipping": clipping_stats(calibration),
-        "conditioned_clipping": clipping_stats(conditioned_enh),
+        "profile": profile.as_metadata(),
+        **three_way_metrics,
     }
 
-    listener_space = {
-        "impaired_input": listener_space_metrics(original, impaired, ag, sr=sr, output_already_impaired=True),
-        "baseline": listener_space_metrics(original, baseline_enh, ag, sr=sr),
-        "calibration": listener_space_metrics(original, calibration, ag, sr=sr),
-        "conditioned": listener_space_metrics(original, conditioned_enh, ag, sr=sr),
-    }
+    _save_hf_plot(metric_rows["hf"], out / "hf_energy_comparison.png")
+    _save_safety_plot(metric_rows["safety"], out / "safety_summary.png")
 
-    metric_rows: dict[str, float | dict[str, float] | str | list[float]] = {
-        "signal_space": signal_space_metrics,
-        "listener_space": listener_space,
-        "audiogram": ag.squeeze(0).tolist(),
-    }
-    logger.info(f"Metrics: {metric_rows}")
+    summary = _human_summary(metric_rows)
+    logger.info(summary)
+    print(summary)
     log_json(out, "metrics.json", metric_rows)
     return out
 
@@ -163,7 +205,7 @@ def main(
     config: str = "personalized_hearing_enhancement/configs/default.yaml",
     baseline_ckpt: str = "outputs/checkpoints/baseline_best.pt",
     conditioned_ckpt: str = "outputs/checkpoints/conditioned_best.pt",
-    audiogram: str = "20,25,30,45,60,65,70,75",
+    audiogram: str | None = None,
     output_dir: str = "outputs",
     run_name: str = "demo_audio",
     mode: str = "model",

@@ -7,9 +7,10 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
+from personalized_hearing_enhancement.audiometry.profiles import HearingProfile, resolve_profile_input
 from personalized_hearing_enhancement.models.conditioned_tasnet import ConditionedConvTasNet
 from personalized_hearing_enhancement.models.tasnet import ConvTasNet
-from personalized_hearing_enhancement.simulation.calibration_filter import apply_calibration_filter
+from personalized_hearing_enhancement.simulation.calibration_filter import apply_profile_calibration, resolve_device_profile
 from personalized_hearing_enhancement.simulation.hearing_loss import apply_hearing_loss
 from personalized_hearing_enhancement.simulation.loudness import safe_post_amplification
 from personalized_hearing_enhancement.utils.audio import load_audio, save_audio
@@ -51,15 +52,16 @@ def process_audio(
     wav_path: str | Path,
     baseline_ckpt: str | Path,
     conditioned_ckpt: str | Path,
-    audiogram: torch.Tensor,
+    profile: HearingProfile,
     config_path: str,
     output_dir: str | Path,
-    device_profile: str = "headphones",
+    device_profile: str | None = None,
     max_gain_db: float = 20.0,
 ) -> dict[str, Path]:
     cfg = OmegaConf.load(config_path)
     sr = int(cfg.sample_rate)
     wav = load_audio(wav_path, sr=sr).unsqueeze(0)
+    audiogram = profile.to_tensor()
     impaired = apply_hearing_loss(wav, audiogram, sr=sr)
 
     baseline = _load_model("baseline", Path(baseline_ckpt), cfg)
@@ -69,11 +71,16 @@ def process_audio(
         b = baseline(wav)
         c = conditioned(wav, audiogram)
 
-    calibration = apply_calibration_filter(
+    selected_device = device_profile
+    if selected_device is None:
+        selected_device = profile.get_device_profile("headphones") or "headphones"
+    profile_name, _, _ = resolve_device_profile(selected_device)
+
+    calibration = apply_profile_calibration(
         wav.squeeze(0),
-        audiogram,
+        profile,
         sample_rate=sr,
-        device_profile=device_profile,
+        device_profile=profile_name,
         max_gain_db=max_gain_db,
         chunk_size=512,
     ).unsqueeze(0)
@@ -84,19 +91,25 @@ def process_audio(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    clean_p = out_dir / "original.wav"
-    deg_p = out_dir / "impaired.wav"
-    b_p = out_dir / "baseline.wav"
+    original_p = out_dir / "original.wav"
+    impaired_p = out_dir / "impaired.wav"
+    baseline_p = out_dir / "baseline.wav"
     cal_p = out_dir / "calibration.wav"
-    c_p = out_dir / "conditioned.wav"
-    save_audio(clean_p, wav.squeeze(0), sr)
+    conditioned_p = out_dir / "conditioned.wav"
+    save_audio(original_p, wav.squeeze(0), sr)
     save_audio(out_dir / "clean.wav", wav.squeeze(0), sr)
-    save_audio(deg_p, impaired.squeeze(0), sr)
+    save_audio(impaired_p, impaired.squeeze(0), sr)
     save_audio(out_dir / "degraded.wav", impaired.squeeze(0), sr)
-    save_audio(b_p, b.squeeze(0), sr)
+    save_audio(baseline_p, b.squeeze(0), sr)
     save_audio(cal_p, calibration.squeeze(0), sr)
-    save_audio(c_p, c.squeeze(0), sr)
-    return {"original": clean_p, "impaired": deg_p, "baseline": b_p, "calibration": cal_p, "conditioned": c_p}
+    save_audio(conditioned_p, c.squeeze(0), sr)
+    return {
+        "original": original_p,
+        "impaired": impaired_p,
+        "baseline": baseline_p,
+        "calibration": cal_p,
+        "conditioned": conditioned_p,
+    }
 
 
 def _video_with_audio(input_video: Path, audio_path: Path, output_video: Path, label: str) -> None:
@@ -139,9 +152,9 @@ def _create_visual_grid(vids: dict[str, Path], out: Path) -> Path:
         "-i",
         str(vids["impaired"]),
         "-i",
-        str(vids["baseline"]),
-        "-i",
         str(vids["calibration"]),
+        "-i",
+        str(vids["baseline"]),
         "-i",
         str(vids["conditioned"]),
         "-i",
@@ -158,7 +171,7 @@ def _create_visual_grid(vids: dict[str, Path], out: Path) -> Path:
 
 def _create_sequential_comparison(vids: dict[str, Path], out: Path) -> Path:
     list_file = out / "sequential_inputs.txt"
-    order = ["original", "impaired", "baseline", "calibration", "conditioned"]
+    order = ["original", "impaired", "calibration", "baseline", "conditioned"]
     with list_file.open("w", encoding="utf-8") as f:
         for key in order:
             if key not in vids or not vids[key].exists():
@@ -189,24 +202,40 @@ def create_comparison_video(
     output_dir: str | Path,
     baseline_ckpt: str | Path,
     conditioned_ckpt: str | Path,
-    audiogram: torch.Tensor,
+    audiogram: torch.Tensor | None,
     config_path: str,
-    device_profile: str = "headphones",
+    device_profile: str | None = "headphones",
     max_gain_db: float = 20.0,
+    profile_json: str | None = None,
+    profile: HearingProfile | None = None,
 ) -> Path:
     ensure_ffmpeg()
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     source = Path(original_mp4)
+
+    if profile is None:
+        manual = None if audiogram is None else ",".join(str(float(v)) for v in audiogram.squeeze(0).tolist())
+        profile, _ = resolve_profile_input(profile_json, manual, sample_rate=int(OmegaConf.load(config_path).sample_rate))
+
     wav = extract_audio(source, out / "extracted.wav")
-    stems = process_audio(wav, baseline_ckpt, conditioned_ckpt, audiogram, config_path, out, device_profile=device_profile, max_gain_db=max_gain_db)
+    stems = process_audio(
+        wav,
+        baseline_ckpt,
+        conditioned_ckpt,
+        profile,
+        config_path,
+        out,
+        device_profile=device_profile,
+        max_gain_db=max_gain_db,
+    )
 
     labels = {
         "original": "1) Original",
-        "impaired": "2) Hearing-Impaired",
-        "baseline": "3) Baseline",
-        "calibration": "4) Calibration",
-        "conditioned": "5) Conditioned",
+        "impaired": "2) Hearing-Impaired (Illustrative)",
+        "calibration": "3) Calibration Baseline (DSP)",
+        "baseline": "4) Baseline Model",
+        "conditioned": "5) Conditioned ML (Profile)",
     }
 
     vids: dict[str, Path] = {}

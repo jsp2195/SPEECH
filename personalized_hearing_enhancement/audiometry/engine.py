@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from personalized_hearing_enhancement.audiometry.inference import StaircaseConfig, StaircaseEstimator
 from personalized_hearing_enhancement.audiometry.profiles import HearingProfile
@@ -18,6 +20,27 @@ class AudiometryEngineConfig:
     min_step_size_db: float = 2.0
     max_trials_per_frequency: int = 18
     max_reversals: int = 4
+
+
+@dataclass
+class SimulatedResponderConfig:
+    psychometric_slope: float = 0.35
+
+
+def logistic_hear_probability(amplitude_db_hl: float, threshold_db_hl: float, slope: float = 0.35) -> float:
+    if slope <= 0:
+        raise ValueError("slope must be positive")
+    x = slope * (amplitude_db_hl - threshold_db_hl)
+    if x >= 0:
+        z = math.exp(-x)
+        return float(1.0 / (1.0 + z))
+    z = math.exp(x)
+    return float(z / (1.0 + z))
+
+
+def _simulated_heard(amplitude_db_hl: float, threshold_db_hl: float, rng: random.Random, slope: float) -> tuple[bool, float]:
+    prob = logistic_hear_probability(amplitude_db_hl, threshold_db_hl, slope=slope)
+    return (rng.random() < prob), prob
 
 
 def _to_heard(response: str) -> bool:
@@ -36,6 +59,9 @@ def run_hearing_test(
     ground_truth_audiogram: list[float] | None = None,
     seed: int | None = None,
     save_progress_path: str | None = None,
+    simulated_responder: SimulatedResponderConfig | None = None,
+    response_callback: Callable[[int, float, int], bool] | None = None,
+    verbose: bool = True,
 ) -> tuple[AudiometrySession, HearingProfile]:
     if mode not in {"interactive", "simulated"}:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -43,6 +69,8 @@ def run_hearing_test(
         raise ValueError("ground_truth_audiogram is required in simulated mode")
 
     rng = random.Random(seed)
+    responder_cfg = simulated_responder or SimulatedResponderConfig()
+
     session = AudiometrySession(
         start_amplitude_db_hl=cfg.start_amplitude_db_hl,
         initial_step_size_db=cfg.step_size_db,
@@ -65,14 +93,31 @@ def run_hearing_test(
     for idx, freq in enumerate(session.frequencies_hz):
         session.active_frequency_index = idx
         state = session.state_for(freq)
-        print(f"\nTesting {freq} Hz")
+        if verbose:
+            print(f"\nTesting {freq} Hz")
         while not state.complete:
-            print(f"  Trial {len(state.trials)+1}: level={state.current_db_hl:.1f} dB HL")
+            if verbose:
+                print(f"  Trial {len(state.trials)+1}: level={state.current_db_hl:.1f} dB HL")
             if mode == "simulated":
-                gt = float(ground_truth_audiogram[idx])
-                heard_prob = 1.0 if state.current_db_hl >= gt else 0.0
-                heard = rng.random() < heard_prob
-                print(f"    simulated response: {'heard' if heard else 'not heard'}")
+                if response_callback is not None:
+                    heard = bool(response_callback(freq, float(state.current_db_hl), len(state.trials)))
+                    heard_prob = None
+                else:
+                    gt = float(ground_truth_audiogram[idx])
+                    heard, heard_prob = _simulated_heard(
+                        state.current_db_hl,
+                        gt,
+                        rng,
+                        slope=responder_cfg.psychometric_slope,
+                    )
+                if verbose:
+                    if heard_prob is None:
+                        print(f"    simulated response: {'heard' if heard else 'not heard'}")
+                    else:
+                        print(
+                            f"    simulated response: {'heard' if heard else 'not heard'} "
+                            f"(p_heard={heard_prob:.3f})"
+                        )
             else:
                 heard = _to_heard(input("    Heard tone? [y/n]: "))
 
@@ -80,10 +125,11 @@ def run_hearing_test(
             if save_progress_path:
                 Path(save_progress_path).write_text(json.dumps(session.to_dict(), indent=2), encoding="utf-8")
 
-        print(
-            f"  Completed {freq} Hz -> threshold={state.threshold_estimate_db_hl:.1f} dB HL "
-            f"(uncertainty ±{state.uncertainty_db:.1f}, trials={len(state.trials)})"
-        )
+        if verbose:
+            print(
+                f"  Completed {freq} Hz -> threshold={state.threshold_estimate_db_hl:.1f} dB HL "
+                f"(uncertainty ±{state.uncertainty_db:.1f}, trials={len(state.trials)})"
+            )
 
     summary = estimator.summarize(session)
     thresholds = [float(summary[f]["estimated_threshold_db_hl"]) for f in session.frequencies_hz]
@@ -94,7 +140,12 @@ def run_hearing_test(
         uncertainty=uncertainty,
         source="simulated" if mode == "simulated" else "estimated",
         sample_rate=cfg.sample_rate,
-        metadata={"max_trials_per_frequency": cfg.max_trials_per_frequency, "max_reversals": cfg.max_reversals},
+        metadata={
+            "max_trials_per_frequency": cfg.max_trials_per_frequency,
+            "max_reversals": cfg.max_reversals,
+            "psychometric_slope": responder_cfg.psychometric_slope,
+        },
     )
-    print("\nEstimated thresholds (dB HL):", thresholds)
+    if verbose:
+        print("\nEstimated thresholds (dB HL):", thresholds)
     return session, profile
