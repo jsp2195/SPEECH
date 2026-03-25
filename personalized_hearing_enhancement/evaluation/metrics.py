@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from personalized_hearing_enhancement.simulation.hearing_loss import apply_hearing_loss
+
 
 def si_sdr(target: torch.Tensor, estimate: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     if target.ndim == 1:
@@ -27,6 +29,102 @@ def waveform_l1(target: torch.Tensor, estimate: torch.Tensor) -> torch.Tensor:
 
 
 def pesq_proxy(target: torch.Tensor, estimate: torch.Tensor) -> float:
-    # Fast differentiable-ish proxy based on SDR range mapping.
     score = si_sdr(target, estimate).mean().item()
     return float(max(1.0, min(4.5, 1.0 + (score + 5.0) * 3.5 / 30.0)))
+
+
+def bandwise_energy(waveform: torch.Tensor, sr: int, band_edges: list[tuple[int, int]] | None = None) -> dict[str, float]:
+    if waveform.ndim == 2:
+        waveform = waveform.squeeze(0)
+    band_edges = band_edges or [(0, 500), (500, 1000), (1000, 2000), (2000, 4000), (4000, 8000)]
+    spec = torch.fft.rfft(waveform)
+    freqs = torch.fft.rfftfreq(waveform.numel(), d=1.0 / sr)
+    power = spec.abs() ** 2
+
+    out: dict[str, float] = {}
+    for lo, hi in band_edges:
+        mask = (freqs >= lo) & (freqs < hi)
+        value = power[mask].mean().item() if mask.any() else 0.0
+        out[f"{lo}_{hi}hz"] = float(value)
+    return out
+
+
+def high_frequency_energy_ratio(reference: torch.Tensor, estimate: torch.Tensor, sr: int, threshold_hz: int = 3000) -> float:
+    if reference.ndim == 2:
+        reference = reference.squeeze(0)
+    if estimate.ndim == 2:
+        estimate = estimate.squeeze(0)
+    r_spec = torch.fft.rfft(reference)
+    e_spec = torch.fft.rfft(estimate)
+    freqs = torch.fft.rfftfreq(reference.numel(), d=1.0 / sr)
+    mask = freqs >= threshold_hz
+    r_energy = (r_spec.abs()[mask] ** 2).mean().clamp(min=1e-8)
+    e_energy = (e_spec.abs()[mask] ** 2).mean()
+    return float((e_energy / r_energy).item())
+
+
+def intelligibility_proxy(reference: torch.Tensor, estimate: torch.Tensor) -> float:
+    if reference.ndim == 2:
+        reference = reference.squeeze(0)
+    if estimate.ndim == 2:
+        estimate = estimate.squeeze(0)
+    ref = reference - reference.mean()
+    est = estimate - estimate.mean()
+    corr = torch.sum(ref * est) / (torch.sqrt(torch.sum(ref**2) * torch.sum(est**2)) + 1e-8)
+    return float(corr.clamp(-1.0, 1.0).item())
+
+
+def gain_stats(input_signal: torch.Tensor, output_signal: torch.Tensor) -> dict[str, float]:
+    in_rms = torch.sqrt(torch.mean(input_signal**2) + 1e-8)
+    out_rms = torch.sqrt(torch.mean(output_signal**2) + 1e-8)
+    gain_db = 20.0 * torch.log10(out_rms / in_rms + 1e-8)
+    return {
+        "input_rms": float(in_rms.item()),
+        "output_rms": float(out_rms.item()),
+        "gain_db": float(gain_db.item()),
+    }
+
+
+def log_spectral_distance(reference: torch.Tensor, estimate: torch.Tensor, n_fft: int = 512, hop_length: int = 128) -> float:
+    if reference.ndim == 1:
+        reference = reference.unsqueeze(0)
+    if estimate.ndim == 1:
+        estimate = estimate.unsqueeze(0)
+    if reference.shape != estimate.shape:
+        raise ValueError(f"Shape mismatch for log_spectral_distance: {reference.shape} vs {estimate.shape}")
+
+    win = torch.hann_window(n_fft, device=reference.device)
+    ref_stft = torch.stft(reference, n_fft=n_fft, hop_length=hop_length, window=win, return_complex=True)
+    est_stft = torch.stft(estimate, n_fft=n_fft, hop_length=hop_length, window=win, return_complex=True)
+    ref_log = torch.log1p(ref_stft.abs())
+    est_log = torch.log1p(est_stft.abs())
+    return float(torch.mean(torch.abs(ref_log - est_log)).item())
+
+
+def listener_space_metrics(
+    original: torch.Tensor,
+    output: torch.Tensor,
+    audiogram: torch.Tensor,
+    sr: int,
+    *,
+    output_already_impaired: bool = False,
+) -> dict[str, float]:
+    """Compare H(original, θ) vs H(output, θ) in listener space.
+
+    If `output_already_impaired` is True, output is treated as H(original, θ)-domain already
+    and will not be passed through H again.
+    """
+    if original.ndim == 1:
+        original = original.unsqueeze(0)
+    if output.ndim == 1:
+        output = output.unsqueeze(0)
+    if audiogram.ndim == 1:
+        audiogram = audiogram.unsqueeze(0)
+
+    heard_original = apply_hearing_loss(original, audiogram, sr=sr)
+    heard_output = output if output_already_impaired else apply_hearing_loss(output, audiogram, sr=sr)
+
+    return {
+        "listener_space_si_sdr": float(si_sdr(heard_original, heard_output).mean().item()),
+        "listener_space_spectral_distance": log_spectral_distance(heard_original, heard_output),
+    }

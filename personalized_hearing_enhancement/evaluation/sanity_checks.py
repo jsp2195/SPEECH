@@ -17,6 +17,9 @@ class SanityResult:
 def hearing_simulator_validation(sr: int = 16000, duration_s: float = 1.0) -> SanityResult:
     n = int(sr * duration_s)
     t = torch.arange(n) / sr
+    if float(AUDIOGRAM_FREQS.max().item()) > sr / 2:
+        raise ValueError(f"AUDIOGRAM_FREQS exceed Nyquist ({sr/2}): {AUDIOGRAM_FREQS.tolist()}")
+
     audiogram = torch.tensor([[0, 6, 12, 18, 24, 30, 36, 42]], dtype=torch.float32)
     measured_errors: dict[str, float] = {}
 

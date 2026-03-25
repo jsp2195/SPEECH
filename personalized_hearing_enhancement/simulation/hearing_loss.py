@@ -3,11 +3,25 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-AUDIOGRAM_FREQS = torch.tensor([250, 500, 1000, 2000, 4000, 6000, 8000, 9000], dtype=torch.float32)
+AUDIOGRAM_FREQS = torch.tensor([250, 500, 1000, 2000, 3000, 4000, 6000, 8000], dtype=torch.float32)
+
+
+def _validate_audiogram(audiogram: torch.Tensor, sr: int) -> None:
+    if audiogram.shape[-1] != AUDIOGRAM_FREQS.numel():
+        raise ValueError(
+            f"Audiogram must have {AUDIOGRAM_FREQS.numel()} bands matching {AUDIOGRAM_FREQS.tolist()}, "
+            f"got shape {tuple(audiogram.shape)}"
+        )
+    nyquist = sr / 2
+    if float(AUDIOGRAM_FREQS.max().item()) > nyquist:
+        raise ValueError(
+            f"Audiogram frequency anchors exceed Nyquist ({nyquist} Hz): {AUDIOGRAM_FREQS.tolist()}"
+        )
 
 
 def _interp_response(freqs: torch.Tensor, audiogram: torch.Tensor, sr: int) -> torch.Tensor:
     # freqs: (F,), audiogram: (B, 8)
+    _validate_audiogram(audiogram, sr)
     device = audiogram.device
     ag_freqs = AUDIOGRAM_FREQS.to(device=device)
     f = freqs.to(device=device).unsqueeze(0)  # (1, F)
@@ -49,6 +63,8 @@ def apply_hearing_loss(waveform: torch.Tensor, audiogram: torch.Tensor, sr: int 
         waveform = waveform.unsqueeze(0)
     if audiogram.ndim == 1:
         audiogram = audiogram.unsqueeze(0)
+
+    _validate_audiogram(audiogram, sr)
 
     if waveform.size(0) != audiogram.size(0):
         if audiogram.size(0) == 1:

@@ -25,11 +25,18 @@ curriculum:
   phase1:
     epochs: 1
     hearing_loss: false
-    conditioned: false
+    conditioned: true
   phase2:
     epochs: 2
     hearing_loss: true
     conditioned: true
+
+
+losses:
+  # Optional listener-space term compares H(pred, θ) vs H(clean, θ).
+  listener_space:
+    enabled: false
+    weight: 0.2
 
 dataset:
   librispeech_subset: train-clean-100
@@ -48,7 +55,7 @@ model:
     bottleneck_dim: 128
 
 audiogram:
-  freqs_hz: [250, 500, 1000, 2000, 4000, 6000, 8000, 9000]
+  freqs_hz: [250, 500, 1000, 2000, 3000, 4000, 6000, 8000]
   presets:
     mild: [10, 12, 15, 20, 25, 25, 30, 30]
     moderate: [20, 25, 30, 40, 50, 55, 60, 60]

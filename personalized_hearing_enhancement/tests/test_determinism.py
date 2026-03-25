@@ -7,6 +7,9 @@ import torch
 
 from personalized_hearing_enhancement.data.augment import mix_snr
 from personalized_hearing_enhancement.models.tasnet import ConvTasNet
+from personalized_hearing_enhancement.simulation.calibration_filter import apply_calibration_filter
+from personalized_hearing_enhancement.evaluation.metrics import listener_space_metrics
+from personalized_hearing_enhancement.simulation.hearing_loss import AUDIOGRAM_FREQS
 from personalized_hearing_enhancement.utils.repro import set_global_seed
 
 
@@ -49,3 +52,61 @@ def test_numpy_and_torch_seed_sync() -> None:
 
     assert np.allclose(a1, a2)
     assert torch.allclose(t1, t2)
+
+
+def test_calibration_filter_determinism() -> None:
+    set_global_seed(101)
+    x = torch.randn(16000)
+    audiogram = torch.tensor([[20.0, 25.0, 30.0, 45.0, 60.0, 65.0, 70.0, 75.0]])
+    y1 = apply_calibration_filter(x, audiogram, sample_rate=16000, device_profile="headphones", max_gain_db=20.0)
+
+    set_global_seed(101)
+    y2 = apply_calibration_filter(x, audiogram, sample_rate=16000, device_profile="headphones", max_gain_db=20.0)
+
+    assert torch.allclose(y1, y2, atol=1e-6)
+
+
+
+def test_audiogram_grid_within_nyquist() -> None:
+    assert AUDIOGRAM_FREQS.numel() == 8
+    assert float(AUDIOGRAM_FREQS.max().item()) <= 8000.0
+
+
+def test_listener_space_metrics_shapes() -> None:
+    clean = torch.randn(16000)
+    estimate = torch.randn(16000)
+    audiogram = torch.tensor([[20.0, 25.0, 30.0, 45.0, 55.0, 60.0, 65.0, 70.0]])
+    metrics = listener_space_metrics(clean, estimate, audiogram, sr=16000)
+    assert "listener_space_si_sdr" in metrics
+    assert "listener_space_spectral_distance" in metrics
+
+
+
+def test_conditioned_model_accepts_tasnet_config_keys() -> None:
+    from personalized_hearing_enhancement.models.conditioned_tasnet import ConditionedConvTasNet
+
+    model = ConditionedConvTasNet(
+        encoder_dim=192,
+        feature_dim=96,
+        hidden_dim=384,
+        kernel_size=16,
+        tcn_layers=2,
+        tcn_stacks=1,
+        bottleneck_dim=128,
+    )
+    x = torch.randn(2, 3200)
+    ag = torch.randn(2, 8)
+    y = model(x, ag)
+    assert y.shape == x.shape
+
+
+
+def test_listener_metrics_no_double_apply_for_impaired_output() -> None:
+    from personalized_hearing_enhancement.simulation.hearing_loss import apply_hearing_loss
+
+    original = torch.randn(16000)
+    audiogram = torch.tensor([[20.0, 25.0, 30.0, 45.0, 55.0, 60.0, 65.0, 70.0]])
+    impaired = apply_hearing_loss(original.unsqueeze(0), audiogram, sr=16000).squeeze(0)
+
+    metrics = listener_space_metrics(original, impaired, audiogram, sr=16000, output_already_impaired=True)
+    assert metrics["listener_space_spectral_distance"] < 1e-4

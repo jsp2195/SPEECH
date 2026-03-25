@@ -11,24 +11,27 @@ from torch.utils.data import DataLoader
 
 from personalized_hearing_enhancement.data.dataset import SpeechEnhancementDataset
 from personalized_hearing_enhancement.data.download import download_datasets
-from personalized_hearing_enhancement.evaluation.metrics import pesq_proxy, si_sdr, sisdr_loss, waveform_l1
+from personalized_hearing_enhancement.evaluation.metrics import pesq_proxy, si_sdr
 from personalized_hearing_enhancement.evaluation.sanity_checks import hearing_simulator_validation, identity_model_check
 from personalized_hearing_enhancement.models.conditioned_tasnet import ConditionedConvTasNet
 from personalized_hearing_enhancement.models.tasnet import ConvTasNet, count_parameters
-from personalized_hearing_enhancement.simulation.hearing_loss import apply_hearing_loss
-from personalized_hearing_enhancement.utils.audio import mel_spectrogram
+from personalized_hearing_enhancement.simulation.hearing_loss import AUDIOGRAM_FREQS
 from personalized_hearing_enhancement.utils.logging_utils import build_logger, log_json
 from personalized_hearing_enhancement.utils.plotting import save_curve
+from personalized_hearing_enhancement.training.losses import combined_loss
 from personalized_hearing_enhancement.utils.repro import seed_worker, set_global_seed
 
 app = typer.Typer()
 
 
+EXPECTED_AUDIOGRAM_BANDS = 8
+
+
 def sample_random_audiogram(batch: int, device: torch.device) -> torch.Tensor:
     base = torch.rand(batch, 1, device=device) * 35.0
     slope = torch.rand(batch, 1, device=device) * 8.0
-    idx = torch.arange(8, device=device).view(1, -1)
-    noise = torch.randn(batch, 8, device=device) * 2.0
+    idx = torch.arange(EXPECTED_AUDIOGRAM_BANDS, device=device).view(1, -1)
+    noise = torch.randn(batch, EXPECTED_AUDIOGRAM_BANDS, device=device) * 2.0
     return torch.clamp(base + idx * slope + noise, 0.0, 90.0)
 
 
@@ -48,11 +51,44 @@ def build_model(cfg, model_type: str) -> torch.nn.Module:
     return ConditionedConvTasNet(**kwargs)
 
 
-def compute_loss(clean: torch.Tensor, pred: torch.Tensor, sr: int) -> torch.Tensor:
-    l_sisdr = sisdr_loss(clean, pred)
-    l_mel = torch.mean(torch.abs(mel_spectrogram(clean, sr) - mel_spectrogram(pred, sr)))
-    l_l1 = waveform_l1(clean, pred)
-    return 0.7 * l_sisdr + 0.3 * l_mel + 0.1 * l_l1
+
+def _validate_audiogram_cfg(cfg) -> None:
+    cfg_freqs = list(cfg.audiogram.freqs_hz)
+    if len(cfg_freqs) != EXPECTED_AUDIOGRAM_BANDS:
+        raise ValueError(f"Expected {EXPECTED_AUDIOGRAM_BANDS} audiogram frequencies, got {len(cfg_freqs)}")
+    if max(cfg_freqs) > int(cfg.sample_rate // 2):
+        raise ValueError(f"Audiogram frequency grid exceeds Nyquist ({cfg.sample_rate // 2} Hz): {cfg_freqs}")
+    if cfg_freqs != [int(x) for x in AUDIOGRAM_FREQS.tolist()]:
+        raise ValueError(
+            f"Config audiogram frequencies {cfg_freqs} must match simulator anchors {AUDIOGRAM_FREQS.tolist()}"
+        )
+
+
+def _forward_model(
+    model: torch.nn.Module,
+    model_type: str,
+    inp: torch.Tensor,
+    audiogram: torch.Tensor,
+    *,
+    warn_on_zero_fallback: bool,
+    logger,
+) -> torch.Tensor:
+    """Forward pass with explicit conditioning expectations.
+
+    inp: (B, T) waveform.
+    audiogram: (B, 8) audiogram.
+    """
+    if model_type == "conditioned":
+        if audiogram is None:
+            audiogram = torch.zeros(inp.size(0), EXPECTED_AUDIOGRAM_BANDS, device=inp.device)
+            if warn_on_zero_fallback:
+                logger.warning("Missing audiogram; using explicit zero-audiogram fallback for compatibility.")
+        if audiogram.ndim != 2 or audiogram.shape != (inp.size(0), EXPECTED_AUDIOGRAM_BANDS):
+            raise ValueError(
+                f"Conditioned model requires audiogram shape (B, {EXPECTED_AUDIOGRAM_BANDS}); got {tuple(audiogram.shape)}"
+            )
+        return model(inp, audiogram)
+    return model(inp)
 
 
 def run_training(
@@ -64,6 +100,7 @@ def run_training(
 ) -> Path:
     cfg = OmegaConf.load(config_path)
     set_global_seed(int(cfg.seed))
+    _validate_audiogram_cfg(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     run_dir = Path(cfg.paths.outputs) / run_name
@@ -129,13 +166,24 @@ def run_training(
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
 
     phase_epochs = [cfg.training.epochs]
-    phase_settings = [{"hearing_loss": True, "conditioned": model_type == "conditioned"}]
+    if model_type == "conditioned":
+        # Explicit curriculum behavior: conditioned model always receives audiogram in both phases.
+        phase_settings = [{"conditioned": True, "listener_loss": False}]
+    else:
+        phase_settings = [{"conditioned": False, "listener_loss": False}]
+
     if bool(cfg.curriculum.enabled):
         phase_epochs = [int(cfg.curriculum.phase1.epochs), int(cfg.curriculum.phase2.epochs)]
-        phase_settings = [
-            {"hearing_loss": bool(cfg.curriculum.phase1.hearing_loss), "conditioned": bool(cfg.curriculum.phase1.conditioned)},
-            {"hearing_loss": bool(cfg.curriculum.phase2.hearing_loss), "conditioned": bool(cfg.curriculum.phase2.conditioned)},
-        ]
+        if model_type == "conditioned":
+            phase_settings = [
+                {"conditioned": True, "listener_loss": False},
+                {"conditioned": True, "listener_loss": bool(cfg.losses.listener_space.enabled)},
+            ]
+        else:
+            phase_settings = [
+                {"conditioned": False, "listener_loss": False},
+                {"conditioned": False, "listener_loss": False},
+            ]
 
     steps_per_epoch = int(cfg.debug.train_steps) if debug else int(cfg.training.steps_per_epoch)
     val_steps = int(cfg.debug.val_steps) if debug else int(cfg.training.val_steps)
@@ -170,13 +218,26 @@ def run_training(
                         clean, noisy = next(train_iter)
 
                 clean, noisy = clean.to(device), noisy.to(device)
-                audiogram = sample_random_audiogram(clean.size(0), device)
-                inp = apply_hearing_loss(noisy, audiogram, sr=cfg.sample_rate) if phase["hearing_loss"] else noisy
+                # Signal-space domain: model input is raw/noisy waveform, never hearing-loss-simulated waveform.
+                if model_type == "conditioned":
+                    if phase_idx == 1:
+                        # Phase 1 uses neutral conditioning for stable warm-up while preserving explicit audiogram input.
+                        audiogram = torch.zeros(clean.size(0), EXPECTED_AUDIOGRAM_BANDS, device=device)
+                    else:
+                        audiogram = sample_random_audiogram(clean.size(0), device)
+                else:
+                    audiogram = sample_random_audiogram(clean.size(0), device)
 
-                use_conditioning = phase["conditioned"] and model_type == "conditioned"
-                pred = model(inp, audiogram) if use_conditioning else model(inp)
+                pred = _forward_model(model, model_type, noisy, audiogram, warn_on_zero_fallback=False, logger=logger)
 
-                loss = compute_loss(clean, pred, cfg.sample_rate)
+                loss, _ = combined_loss(
+                    clean,
+                    pred,
+                    audiogram,
+                    sr=cfg.sample_rate,
+                    listener_enabled=bool(phase["listener_loss"]),
+                    listener_weight=float(cfg.losses.listener_space.weight),
+                )
                 optimizer.zero_grad()
                 loss.backward()
                 clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
@@ -201,11 +262,23 @@ def run_training(
                         val_iter = iter(val_dl)
                         clean, noisy = next(val_iter)
                     clean, noisy = clean.to(device), noisy.to(device)
-                    audiogram = sample_random_audiogram(clean.size(0), device)
-                    inp = apply_hearing_loss(noisy, audiogram, sr=cfg.sample_rate) if phase["hearing_loss"] else noisy
-                    use_conditioning = phase["conditioned"] and model_type == "conditioned"
-                    pred = model(inp, audiogram) if use_conditioning else model(inp)
-                    vloss = compute_loss(clean, pred, cfg.sample_rate)
+                    if model_type == "conditioned":
+                        if phase_idx == 1:
+                            audiogram = torch.zeros(clean.size(0), EXPECTED_AUDIOGRAM_BANDS, device=device)
+                        else:
+                            audiogram = sample_random_audiogram(clean.size(0), device)
+                    else:
+                        audiogram = sample_random_audiogram(clean.size(0), device)
+
+                    pred = _forward_model(model, model_type, noisy, audiogram, warn_on_zero_fallback=False, logger=logger)
+                    vloss, _ = combined_loss(
+                        clean,
+                        pred,
+                        audiogram,
+                        sr=cfg.sample_rate,
+                        listener_enabled=bool(phase["listener_loss"]),
+                        listener_weight=float(cfg.losses.listener_space.weight),
+                    )
                     val_losses.append(vloss.item())
                     val_sisdr.append(si_sdr(clean, pred).mean().item())
 
@@ -234,6 +307,7 @@ def run_training(
             "val_loss_best": best_val,
             "overfit_single_batch": overfit_single_batch,
             "debug": debug,
+            "listener_space_loss_enabled": bool(cfg.losses.listener_space.enabled),
             "sanity": {"hearing_simulator": sim_check.details, "identity_model": id_check.details},
         },
     )
