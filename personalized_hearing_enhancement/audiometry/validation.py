@@ -19,6 +19,7 @@ from personalized_hearing_enhancement.audiometry.stimuli import STANDARD_FREQS_H
 @dataclass
 class ValidationRunResult:
     profile_type: str
+    estimator_mode: str
     seed: int
     ground_truth_thresholds: list[float]
     estimated_thresholds: list[float]
@@ -26,6 +27,7 @@ class ValidationRunResult:
     mean_abs_error: float
     total_trials: int
     uncertainty_db: list[float]
+    posterior_entropy: list[float]
 
 
 PROFILE_LIBRARY: dict[str, list[float]] = {
@@ -90,8 +92,13 @@ def run_single_validation(
     total_trials = int(sum(len(session.state_for(freq).trials) for freq in session.frequencies_hz))
     uncertainty = [float(u) for u in estimated_profile.uncertainty]
 
+    entropy_values: list[float] = []
+    if estimated_profile.posterior_entropy:
+        entropy_values = [float(v) for v in estimated_profile.posterior_entropy]
+
     return ValidationRunResult(
         profile_type=profile_type,
+        estimator_mode=engine_cfg.estimator_mode,
         seed=seed,
         ground_truth_thresholds=gt,
         estimated_thresholds=estimated,
@@ -99,6 +106,7 @@ def run_single_validation(
         mean_abs_error=float(np.mean(errors)),
         total_trials=total_trials,
         uncertainty_db=uncertainty,
+        posterior_entropy=entropy_values,
     )
 
 
@@ -109,40 +117,77 @@ def run_validation_suite(
     base_seed: int = 0,
     jitter_std: float = 1.5,
     engine_cfg: AudiometryEngineConfig | None = None,
+    include_staircase_baseline: bool = True,
 ) -> dict:
     cfg = engine_cfg or AudiometryEngineConfig()
-    results: list[ValidationRunResult] = []
+    modes = [cfg.estimator_mode]
+    if include_staircase_baseline and cfg.estimator_mode != "staircase":
+        modes.append("staircase")
 
-    for profile_idx, profile_type in enumerate(PROFILE_LIBRARY.keys()):
-        for run_idx in range(runs_per_profile):
-            seed = base_seed + profile_idx * 10_000 + run_idx
-            results.append(
-                run_single_validation(
-                    profile_type,
-                    engine_cfg=cfg,
-                    slope=slope,
-                    seed=seed,
-                    jitter_std=jitter_std,
+    mode_summaries: dict[str, dict] = {}
+    for mode in modes:
+        mode_cfg = AudiometryEngineConfig(**{**asdict(cfg), "estimator_mode": mode})
+        results: list[ValidationRunResult] = []
+
+        for profile_idx, profile_type in enumerate(PROFILE_LIBRARY.keys()):
+            for run_idx in range(runs_per_profile):
+                seed = base_seed + profile_idx * 10_000 + run_idx
+                results.append(
+                    run_single_validation(
+                        profile_type,
+                        engine_cfg=mode_cfg,
+                        slope=slope,
+                        seed=seed,
+                        jitter_std=jitter_std,
+                    )
                 )
-            )
 
-    mae_values = np.array([r.mean_abs_error for r in results], dtype=np.float32)
-    trial_values = np.array([r.total_trials for r in results], dtype=np.float32)
-    mae_by_frequency: dict[int, float] = {}
-    for freq in STANDARD_FREQS_HZ:
-        mae_by_frequency[freq] = float(np.mean([r.abs_error_by_freq[freq] for r in results]))
+        mae_values = np.array([r.mean_abs_error for r in results], dtype=np.float32)
+        trial_values = np.array([r.total_trials for r in results], dtype=np.float32)
+        uncertainty_values = np.array([np.mean(r.uncertainty_db) for r in results], dtype=np.float32)
+        mae_by_frequency: dict[int, float] = {}
+        for freq in STANDARD_FREQS_HZ:
+            mae_by_frequency[freq] = float(np.mean([r.abs_error_by_freq[freq] for r in results]))
+
+        entropy_mean = float("nan")
+        entropy_delta = float("nan")
+        all_entropies = [np.mean(r.posterior_entropy) for r in results if r.posterior_entropy]
+        if all_entropies:
+            entropy_mean = float(np.mean(all_entropies))
+            initial_entropy = float(np.log(len(mode_cfg.candidate_amplitudes_db_hl) + 1))
+            entropy_delta = float(initial_entropy - entropy_mean)
+
+        mode_summaries[mode] = {
+            "mean_mae": float(np.mean(mae_values)),
+            "median_mae": float(np.median(mae_values)),
+            "mae_by_frequency": mae_by_frequency,
+            "mean_trials_per_profile": float(np.mean(trial_values)),
+            "mean_uncertainty_db": float(np.mean(uncertainty_values)),
+            "mean_posterior_entropy": entropy_mean,
+            "mean_entropy_reduction": entropy_delta,
+            "error_distribution": [float(x) for x in mae_values.tolist()],
+            "runs": [asdict(r) for r in results],
+        }
 
     summary = {
         "runs_per_profile": runs_per_profile,
         "profile_types": list(PROFILE_LIBRARY.keys()),
         "psychometric_slope": slope,
-        "mean_mae": float(np.mean(mae_values)),
-        "median_mae": float(np.median(mae_values)),
-        "mae_by_frequency": mae_by_frequency,
-        "mean_trials_per_profile": float(np.mean(trial_values)),
-        "error_distribution": [float(x) for x in mae_values.tolist()],
-        "runs": [asdict(r) for r in results],
+        "estimator_modes": modes,
+        "primary_mode": cfg.estimator_mode,
+        "results_by_mode": mode_summaries,
     }
+    primary = mode_summaries[cfg.estimator_mode]
+    summary.update(
+        {
+            "mean_mae": primary["mean_mae"],
+            "median_mae": primary["median_mae"],
+            "mae_by_frequency": primary["mae_by_frequency"],
+            "mean_trials_per_profile": primary["mean_trials_per_profile"],
+            "error_distribution": primary["error_distribution"],
+            "runs": primary["runs"],
+        }
+    )
     return summary
 
 
