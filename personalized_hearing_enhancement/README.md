@@ -2,133 +2,78 @@
 
 A production-ready repository for **profile-centric hearing personalization** across audio and video enhancement.
 
-## Phase 4 Evidence Story
+## Phase 5B1: Reliability-Aware Bayesian Audiometry
 
-This repository now supports two explicit evidence claims:
+The hearing-test front end now uses **reliability-aware Bayesian active audiometry**:
 
-1. **Output-side user-benefit comparison** using the same `HearingProfile`:
-   - impaired input
-   - calibration baseline (deterministic DSP baseline)
-   - conditioned ML output (challenger)
+1. Bayesian threshold posterior on a discrete dB grid
+2. likelihood with lapse/guess behavior
+3. one-step expected information gain probe selection
+4. posterior mean + uncertainty + reliability summary
 
-2. **Front-end audiometry validation** using synthetic users with logistic yes/no psychometric responses.
+Psychometric model:
 
-Primary question:
+`P(heard=1 | a, θ, λ, g) = (1-λ)*sigmoid(k*(a-θ)) + λ*g`
 
-**Does conditioned ML improve on the deterministic calibration baseline in listener space?**
+Where `λ` is lapse rate and `g` is guess rate.
 
-## Core Personalization Contract
+### Not included yet
+- device-gain nuisance parameters
+- calibration-invariant inference
+- shared latent hardware gain
+- full latent human-state models
+- cross-frequency GP coupling
 
-`HearingProfile -> hearing simulation -> calibration baseline -> conditioned ML -> metrics/reporting`
+## Closed loop
 
-## Installation
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r personalized_hearing_enhancement/requirements.txt
-```
-
-## Setup Data
-```bash
-python -m personalized_hearing_enhancement.cli.main prepare-data --config personalized_hearing_enhancement/configs/default.yaml
-```
-
-## Training
-```bash
-python -m personalized_hearing_enhancement.cli.main train --model-type baseline
-python -m personalized_hearing_enhancement.cli.main train --model-type conditioned
-```
+1. reliability-aware Bayesian audiometry estimates profile
+2. profile JSON is saved with uncertainty + reliability metadata
+3. calibration baseline is applied
+4. conditioned ML personalization is applied
+5. listener-space comparisons run on audio/video outputs
 
 ## Hearing Test + Profile
 
-### Estimate hearing profile
+### Estimate profile (simulated, reliability-aware)
 ```bash
 python -m personalized_hearing_enhancement.cli.main estimate-profile \
   --mode simulated \
+  --audiometry_mode bayesian \
+  --response_model lapse_logistic \
+  --lapse_rate 0.10 \
+  --guess_rate 0.5 \
+  --simulate_fatigue \
+  --fatigue_lapse_increment 0.006 \
+  --inconsistency_rate 0.10 \
   --simulated_audiogram "20,25,30,45,60,65,70,75" \
   --output_profile_json outputs/estimated_profile.json
 ```
 
-### Show profile
+### Legacy baseline mode (optional)
 ```bash
-python -m personalized_hearing_enhancement.cli.main show-profile \
-  --profile_json outputs/estimated_profile.json \
-  --save_plot_path outputs/estimated_profile.png
+python -m personalized_hearing_enhancement.cli.main estimate-profile \
+  --mode simulated \
+  --audiometry_mode staircase \
+  --simulated_audiogram "20,25,30,45,60,65,70,75"
 ```
 
-## Demo Audio (Three-way comparison)
+## Validation (clean + noisy responder scenarios)
 
-### Preferred path: profile JSON
-```bash
-python -m personalized_hearing_enhancement.cli.main demo-audio \
-  --input-wav sample.wav \
-  --profile_json outputs/estimated_profile.json \
-  --run-name demo1
-```
+`validate-audiometry` runs scenario coverage including:
+- normal clean
+- normal lapse-noise
+- sloping HF clean
+- sloping HF lapse-noise
+- irregular inconsistent responder
+- mild-loss fatigue responder
 
-### Backward-compatible fallback: manual audiogram
-```bash
-python -m personalized_hearing_enhancement.cli.main demo-audio \
-  --input-wav sample.wav \
-  --audiogram "20,25,30,45,60,65,70,75" \
-  --run-name demo1
-```
-
-Precedence:
-- `--profile_json` if provided
-- else `--audiogram`
-- else error
-
-Outputs in `outputs/demo1/` include:
-- `original.wav`
-- `impaired.wav`
-- `calibration.wav` (**deterministic baseline**)
-- `conditioned.wav` (**ML challenger**)
-- optional `baseline.wav`
-- `metrics.json` with:
-  - `signal_space`
-  - `listener_space`
-  - `hf`
-  - `safety`
-  - `comparison` (`conditioned_vs_calibration_*` deltas)
-- `hf_energy_comparison.png`
-- `safety_summary.png`
-
-## Video Processing
-```bash
-python -m personalized_hearing_enhancement.cli.main process-video \
-  --input sample.mp4 \
-  --profile_json outputs/estimated_profile.json \
-  --run-name video1
-```
-
-Outputs include `original.mp4`, `impaired.mp4`, `calibration.mp4`, `conditioned.mp4`, and `comparison_sequential.mp4`.
-
-## Audiometry Validation (Simulated Users)
-
-Validation uses logistic psychometric responses:
-
-`P(heard=1 | level, threshold) = sigmoid(k * (level - threshold))`
-
-Supported synthetic profile families:
-- normal hearing
-- mild loss
-- sloping high-frequency loss
-- irregular profile
-
-Run validation:
 ```bash
 python -m personalized_hearing_enhancement.cli.main validate-audiometry \
+  --audiometry_mode bayesian \
+  --include_staircase_baseline \
   --runs_per_profile 5 \
   --psychometric_slope 0.35 \
   --output_json outputs/audiometry_validation_summary.json
 ```
 
-Summary reports include mean/median MAE, MAE by frequency, mean trials per profile, and run-level recovery errors.
-
-## Sanity + Tests
-```bash
-PYTHONPATH=. pytest personalized_hearing_enhancement/tests/test_audiometry_phase2.py
-PYTHONPATH=. pytest personalized_hearing_enhancement/tests/test_audiometry_validation.py
-PYTHONPATH=. pytest personalized_hearing_enhancement/tests/test_determinism.py
-```
+Summary includes MAE, trials, uncertainty, reliability score, and scenario-level comparisons.
