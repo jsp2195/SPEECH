@@ -5,7 +5,7 @@ from pathlib import Path
 import typer
 from omegaconf import OmegaConf
 
-from personalized_hearing_enhancement.audiometry.engine import AudiometryEngineConfig, run_hearing_test
+from personalized_hearing_enhancement.audiometry.engine import AudiometryEngineConfig, SimulatedResponderConfig, run_hearing_test
 from personalized_hearing_enhancement.audiometry.validation import run_validation_suite, save_validation_summary
 from personalized_hearing_enhancement.audiometry.profiles import (
     HearingProfile,
@@ -31,6 +31,45 @@ def _get_cfg(config: str):
     cfg = OmegaConf.load(config)
     set_global_seed(int(cfg.seed))
     return cfg
+
+
+def _build_audiometry_engine_cfg(
+    cfg,
+    *,
+    estimator_mode: str | None = None,
+    lapse_rate: float | None = None,
+    guess_rate: float | None = None,
+    infer_device_gain: bool | None = None,
+    device_gain_grid_db: str | None = None,
+) -> AudiometryEngineConfig:
+    audiometry_cfg = cfg.get("audiometry", {}) if hasattr(cfg, "get") else {}
+    bayes = audiometry_cfg.get("bayesian", {}) if hasattr(audiometry_cfg, "get") else {}
+    gain_grid = bayes.get("device_gain_grid_db", [-18, -15, -12, -9, -6, -3, 0, 3, 6, 9, 12, 15, 18])
+    if device_gain_grid_db:
+        gain_grid = [float(x.strip()) for x in device_gain_grid_db.split(",") if x.strip()]
+
+    return AudiometryEngineConfig(
+        sample_rate=int(cfg.sample_rate),
+        estimator_mode=(estimator_mode or str(audiometry_cfg.get("estimator_mode", "bayesian"))),
+        start_amplitude_db_hl=float(audiometry_cfg.get("start_amplitude_db_hl", 40.0)),
+        step_size_db=float(audiometry_cfg.get("step_size_db", 10.0)),
+        min_step_size_db=float(audiometry_cfg.get("min_step_size_db", 2.0)),
+        max_trials_per_frequency=int(audiometry_cfg.get("max_trials_per_frequency", 18)),
+        max_reversals=int(audiometry_cfg.get("max_reversals", 4)),
+        threshold_min_db_hl=float(bayes.get("threshold_min_db_hl", 0.0)),
+        threshold_max_db_hl=float(bayes.get("threshold_max_db_hl", 100.0)),
+        threshold_step_db=float(bayes.get("threshold_step_db", 2.0)),
+        psychometric_slope=float(bayes.get("psychometric_slope", 0.35)),
+        lapse_rate=float(bayes.get("lapse_rate", 0.0) if lapse_rate is None else lapse_rate),
+        guess_rate=float(bayes.get("guess_rate", 0.5) if guess_rate is None else guess_rate),
+        infer_device_gain=bool(bayes.get("infer_device_gain", True) if infer_device_gain is None else infer_device_gain),
+        device_gain_grid_db=[float(v) for v in gain_grid],
+        candidate_amplitudes_db_hl=[float(v) for v in bayes.get("candidate_amplitudes_db_hl", [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])],
+        variance_stop_threshold=float(bayes.get("variance_stop_threshold", 9.0)),
+        entropy_stop_threshold=float(bayes.get("entropy_stop_threshold", 1.4)),
+        min_trials_per_frequency=int(bayes.get("min_trials_per_frequency", 6)),
+        low_reliability_threshold=float(bayes.get("low_reliability_threshold", 0.45)),
+    )
 
 
 def _find_debug_wav(cfg) -> Path:
@@ -68,11 +107,38 @@ def run_hearing_test_cmd(
     simulated_audiogram: str = typer.Option("20,25,30,45,60,65,70,75", help="8 comma-separated dB HL thresholds"),
     seed: int = typer.Option(0, "--seed"),
     save_progress_path: str | None = typer.Option(None, "--save_progress_path"),
+    audiometry_mode: str = typer.Option("bayesian", "--audiometry_mode", help="bayesian or staircase"),
+    lapse_rate: float | None = typer.Option(None, "--lapse_rate"),
+    guess_rate: float | None = typer.Option(None, "--guess_rate"),
+    response_model: str = typer.Option("clean_logistic", "--response_model", help="clean_logistic or lapse_logistic"),
+    simulate_fatigue: bool = typer.Option(False, "--simulate_fatigue"),
+    inconsistency_rate: float = typer.Option(0.0, "--inconsistency_rate"),
+    fatigue_lapse_increment: float = typer.Option(0.0, "--fatigue_lapse_increment"),
+    infer_device_gain: bool = typer.Option(True, "--infer_device_gain"),
+    device_gain_grid_db: str | None = typer.Option(None, "--device_gain_grid_db"),
+    true_device_gain_db: float = typer.Option(0.0, "--true_device_gain_db"),
 ) -> None:
     cfg = _get_cfg(config)
-    engine_cfg = AudiometryEngineConfig(sample_rate=int(cfg.sample_rate))
+    engine_cfg = _build_audiometry_engine_cfg(cfg, estimator_mode=audiometry_mode, lapse_rate=lapse_rate, guess_rate=guess_rate, infer_device_gain=infer_device_gain, device_gain_grid_db=device_gain_grid_db)
     gt = parse_manual_audiogram(simulated_audiogram) if mode == "simulated" else None
-    run_hearing_test(engine_cfg, mode=mode, ground_truth_audiogram=gt, seed=seed, save_progress_path=save_progress_path)
+    simulated_responder = SimulatedResponderConfig(
+        psychometric_slope=engine_cfg.psychometric_slope,
+        lapse_rate=engine_cfg.lapse_rate,
+        guess_rate=engine_cfg.guess_rate,
+        true_device_gain_db=true_device_gain_db,
+        response_model=response_model,
+        simulate_fatigue=simulate_fatigue,
+        inconsistency_rate=inconsistency_rate,
+        fatigue_lapse_increment=fatigue_lapse_increment,
+    )
+    run_hearing_test(
+        engine_cfg,
+        mode=mode,
+        ground_truth_audiogram=gt,
+        seed=seed,
+        save_progress_path=save_progress_path,
+        simulated_responder=simulated_responder if mode == "simulated" else None,
+    )
 
 
 @app.command("estimate-profile")
@@ -83,11 +149,37 @@ def estimate_profile(
     simulated_audiogram: str = typer.Option("20,25,30,45,60,65,70,75", help="8 comma-separated dB HL thresholds"),
     seed: int = typer.Option(0, "--seed"),
     notes: str = typer.Option("", "--notes"),
+    audiometry_mode: str = typer.Option("bayesian", "--audiometry_mode", help="bayesian or staircase"),
+    lapse_rate: float | None = typer.Option(None, "--lapse_rate"),
+    guess_rate: float | None = typer.Option(None, "--guess_rate"),
+    response_model: str = typer.Option("clean_logistic", "--response_model", help="clean_logistic or lapse_logistic"),
+    simulate_fatigue: bool = typer.Option(False, "--simulate_fatigue"),
+    inconsistency_rate: float = typer.Option(0.0, "--inconsistency_rate"),
+    fatigue_lapse_increment: float = typer.Option(0.0, "--fatigue_lapse_increment"),
+    infer_device_gain: bool = typer.Option(True, "--infer_device_gain"),
+    device_gain_grid_db: str | None = typer.Option(None, "--device_gain_grid_db"),
+    true_device_gain_db: float = typer.Option(0.0, "--true_device_gain_db"),
 ) -> None:
     cfg = _get_cfg(config)
-    engine_cfg = AudiometryEngineConfig(sample_rate=int(cfg.sample_rate))
+    engine_cfg = _build_audiometry_engine_cfg(cfg, estimator_mode=audiometry_mode, lapse_rate=lapse_rate, guess_rate=guess_rate, infer_device_gain=infer_device_gain, device_gain_grid_db=device_gain_grid_db)
     gt = parse_manual_audiogram(simulated_audiogram) if mode == "simulated" else None
-    _, profile = run_hearing_test(engine_cfg, mode=mode, ground_truth_audiogram=gt, seed=seed)
+    simulated_responder = SimulatedResponderConfig(
+        psychometric_slope=engine_cfg.psychometric_slope,
+        lapse_rate=engine_cfg.lapse_rate,
+        guess_rate=engine_cfg.guess_rate,
+        true_device_gain_db=true_device_gain_db,
+        response_model=response_model,
+        simulate_fatigue=simulate_fatigue,
+        inconsistency_rate=inconsistency_rate,
+        fatigue_lapse_increment=fatigue_lapse_increment,
+    )
+    _, profile = run_hearing_test(
+        engine_cfg,
+        mode=mode,
+        ground_truth_audiogram=gt,
+        seed=seed,
+        simulated_responder=simulated_responder if mode == "simulated" else None,
+    )
     profile.notes = notes
     saved = save_profile(profile, output_profile_json)
     print(f"Saved hearing profile: {saved}")
@@ -197,6 +289,12 @@ def validate_audiometry(
     jitter_std: float = typer.Option(1.5, "--jitter_std"),
     seed: int = typer.Option(0, "--seed"),
     output_json: str = typer.Option("outputs/audiometry_validation_summary.json", "--output_json"),
+    audiometry_mode: str = typer.Option("bayesian", "--audiometry_mode", help="bayesian or staircase"),
+    include_staircase_baseline: bool = typer.Option(True, "--include_staircase_baseline"),
+    lapse_rate: float | None = typer.Option(None, "--lapse_rate"),
+    guess_rate: float | None = typer.Option(None, "--guess_rate"),
+    infer_device_gain: bool = typer.Option(True, "--infer_device_gain"),
+    device_gain_grid_db: str | None = typer.Option(None, "--device_gain_grid_db"),
 ) -> None:
     cfg = _get_cfg(config)
     summary = run_validation_suite(
@@ -204,11 +302,15 @@ def validate_audiometry(
         slope=psychometric_slope,
         base_seed=seed,
         jitter_std=jitter_std,
-        engine_cfg=AudiometryEngineConfig(sample_rate=int(cfg.sample_rate)),
+        engine_cfg=_build_audiometry_engine_cfg(cfg, estimator_mode=audiometry_mode, lapse_rate=lapse_rate, guess_rate=guess_rate, infer_device_gain=infer_device_gain, device_gain_grid_db=device_gain_grid_db),
+        include_staircase_baseline=include_staircase_baseline,
     )
     saved = save_validation_summary(summary, output_json)
     print(f"Saved audiometry validation summary: {saved}")
-    print(f"Mean MAE: {summary['mean_mae']:.2f} dB | Mean trials/profile: {summary['mean_trials_per_profile']:.1f}")
+    print(
+        f"Mean MAE: {summary['mean_mae']:.2f} dB | Mean trials/profile: {summary['mean_trials_per_profile']:.1f} "
+        f"| Mean gain error: {summary.get('mean_gain_abs_error', float('nan')):.3f} dB | joint_latent_scaffold=enabled"
+    )
 
 
 @app.command()
@@ -220,7 +322,7 @@ def debug(config: str = "personalized_hearing_enhancement/configs/default.yaml")
     run_training(config, "conditioned", debug=True, overfit_single_batch=False, run_name=f"{cfg.debug.run_name}_conditioned")
     input_wav = _find_debug_wav(cfg)
     _, profile = run_hearing_test(
-        AudiometryEngineConfig(sample_rate=int(cfg.sample_rate)),
+        _build_audiometry_engine_cfg(cfg),
         mode="simulated",
         ground_truth_audiogram=[20, 25, 30, 45, 60, 65, 70, 75],
         seed=123,
