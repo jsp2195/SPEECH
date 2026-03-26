@@ -18,6 +18,16 @@ class FrequencyState:
     uncertainty_db: float | None = None
     trials: list[dict[str, float | bool]] = field(default_factory=list)
 
+    # Bayesian tracking fields (Phase 5A/5B1)
+    posterior_grid_db_hl: list[float] = field(default_factory=list)
+    posterior_probs: list[float] = field(default_factory=list)
+    posterior_mean_db_hl: float | None = None
+    posterior_variance_db2: float | None = None
+    posterior_entropy: float | None = None
+    posterior_map_db_hl: float | None = None
+    posterior_ci95: list[float] | None = None
+    inconsistency_count: int = 0
+
 
 @dataclass
 class AudiometrySession:
@@ -31,7 +41,18 @@ class AudiometrySession:
     source: str = "interactive"
     session_started_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     active_frequency_index: int = 0
+    active_amplitude_db_hl: float | None = None
     frequencies: dict[int, FrequencyState] = field(default_factory=dict)
+    joint_inference_state: dict = field(default_factory=dict)
+
+    # Reliability summary fields (Phase 5B1)
+    total_trials: int = 0
+    inconsistency_count: int = 0
+    reliability_score: float = 1.0
+    lapse_rate_used: float = 0.0
+    guess_rate_used: float = 0.5
+    fatigue_enabled: bool = False
+    low_confidence: bool = False
 
     def __post_init__(self) -> None:
         if not self.frequencies:
@@ -64,4 +85,13 @@ class AudiometrySession:
         payload = dict(payload)
         raw_freq = payload.get("frequencies", {})
         payload["frequencies"] = {int(k): FrequencyState(**v) for k, v in raw_freq.items()}
+        payload.setdefault("total_trials", 0)
+        payload.setdefault("inconsistency_count", 0)
+        payload.setdefault("reliability_score", 1.0)
+        payload.setdefault("lapse_rate_used", 0.0)
+        payload.setdefault("guess_rate_used", 0.5)
+        payload.setdefault("fatigue_enabled", False)
+        payload.setdefault("low_confidence", False)
+        payload.setdefault("active_amplitude_db_hl", None)
+        payload.setdefault("joint_inference_state", {})
         return cls(**payload)

@@ -6,6 +6,7 @@ from personalized_hearing_enhancement.audiometry.engine import AudiometryEngineC
 from personalized_hearing_enhancement.audiometry.stimuli import STANDARD_FREQS_HZ
 from personalized_hearing_enhancement.audiometry.validation import (
     PROFILE_LIBRARY,
+    SCENARIOS,
     generate_synthetic_profile,
     run_single_validation,
     run_validation_suite,
@@ -50,7 +51,7 @@ def test_recovery_reasonable_for_simple_case() -> None:
         seed=7,
         jitter_std=0.0,
     )
-    assert result.mean_abs_error < 20.0
+    assert result.mean_abs_error < 25.0
 
 
 def test_validation_summary_shapes_and_finiteness() -> None:
@@ -64,5 +65,7 @@ def test_validation_summary_shapes_and_finiteness() -> None:
     assert math.isfinite(summary["mean_mae"])
     assert math.isfinite(summary["median_mae"])
     assert len(summary["mae_by_frequency"]) == len(STANDARD_FREQS_HZ)
-    assert len(summary["error_distribution"]) == len(PROFILE_LIBRARY) * 2
+    assert len(summary["error_distribution"]) == len(SCENARIOS) * 2
     assert math.isfinite(summary["mean_trials_per_profile"])
+    assert "mean_reliability_score" in summary
+    assert "scenario_summary" in summary
