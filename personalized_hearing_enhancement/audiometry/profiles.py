@@ -18,6 +18,9 @@ class HearingProfile:
     frequencies: list[int]
     thresholds_db: list[float]
     uncertainty: list[float] = field(default_factory=list)
+    posterior_variance: list[float] = field(default_factory=list)
+    posterior_entropy: list[float] = field(default_factory=list)
+    credible_interval_width: list[float] = field(default_factory=list)
     timestamp_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     device_profile: str | None = None
     notes: str = ""
@@ -47,19 +50,27 @@ class HearingProfile:
         return payload
 
 
+def _validate_optional_array(values: list[float], length: int, name: str) -> None:
+    if values and len(values) != length:
+        raise ValueError(f"{name} length must match frequencies length")
+    for i, value in enumerate(values or []):
+        if not math.isfinite(float(value)):
+            raise ValueError(f"Non-finite {name} at index {i}: {value}")
+
+
 def validate_profile(profile: HearingProfile) -> None:
     if profile.frequencies != STANDARD_FREQS_HZ:
         raise ValueError(f"Profile frequencies must equal {STANDARD_FREQS_HZ}, got {profile.frequencies}")
     if len(profile.thresholds_db) != len(profile.frequencies):
         raise ValueError("Profile thresholds length must match frequencies length")
-    if profile.uncertainty and len(profile.uncertainty) != len(profile.frequencies):
-        raise ValueError("Uncertainty length must match frequencies length")
     for i, value in enumerate(profile.thresholds_db):
         if not math.isfinite(float(value)):
             raise ValueError(f"Non-finite threshold at index {i}: {value}")
-    for i, value in enumerate(profile.uncertainty or []):
-        if not math.isfinite(float(value)):
-            raise ValueError(f"Non-finite uncertainty at index {i}: {value}")
+
+    _validate_optional_array(profile.uncertainty, len(profile.frequencies), "uncertainty")
+    _validate_optional_array(profile.posterior_variance, len(profile.frequencies), "posterior_variance")
+    _validate_optional_array(profile.posterior_entropy, len(profile.frequencies), "posterior_entropy")
+    _validate_optional_array(profile.credible_interval_width, len(profile.frequencies), "credible_interval_width")
 
 
 def save_profile(profile: HearingProfile, path: str | Path) -> Path:
@@ -72,6 +83,11 @@ def save_profile(profile: HearingProfile, path: str | Path) -> Path:
 
 def load_profile(path: str | Path) -> HearingProfile:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload.setdefault("uncertainty", [])
+    payload.setdefault("posterior_variance", [])
+    payload.setdefault("posterior_entropy", [])
+    payload.setdefault("credible_interval_width", [])
+    payload.setdefault("metadata", {})
     profile = HearingProfile(**payload)
     validate_profile(profile)
     return profile

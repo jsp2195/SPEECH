@@ -68,6 +68,24 @@ debug:
   val_steps: 2
   run_name: debug_run
 
+
+audiometry:
+  estimator_mode: bayesian
+  start_amplitude_db_hl: 40.0
+  step_size_db: 10.0
+  min_step_size_db: 2.0
+  max_trials_per_frequency: 18
+  max_reversals: 4
+  bayesian:
+    threshold_min_db_hl: 0.0
+    threshold_max_db_hl: 100.0
+    threshold_step_db: 2.0
+    psychometric_slope: 0.35
+    candidate_amplitudes_db_hl: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    variance_stop_threshold: 9.0
+    entropy_stop_threshold: 1.4
+    min_trials_per_frequency: 6
+
 video:
   codec_video: libx264
   codec_audio: aac

@@ -18,6 +18,15 @@ class FrequencyState:
     uncertainty_db: float | None = None
     trials: list[dict[str, float | bool]] = field(default_factory=list)
 
+    # Bayesian tracking fields (Phase 5A)
+    posterior_grid_db_hl: list[float] = field(default_factory=list)
+    posterior_probs: list[float] = field(default_factory=list)
+    posterior_mean_db_hl: float | None = None
+    posterior_variance_db2: float | None = None
+    posterior_entropy: float | None = None
+    posterior_map_db_hl: float | None = None
+    posterior_ci95: list[float] | None = None
+
 
 @dataclass
 class AudiometrySession:

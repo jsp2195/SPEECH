@@ -33,6 +33,29 @@ def _get_cfg(config: str):
     return cfg
 
 
+def _build_audiometry_engine_cfg(cfg, *, estimator_mode: str | None = None) -> AudiometryEngineConfig:
+    audiometry_cfg = cfg.get("audiometry", {}) if hasattr(cfg, "get") else {}
+    bayes = audiometry_cfg.get("bayesian", {}) if hasattr(audiometry_cfg, "get") else {}
+
+    return AudiometryEngineConfig(
+        sample_rate=int(cfg.sample_rate),
+        estimator_mode=(estimator_mode or str(audiometry_cfg.get("estimator_mode", "bayesian"))),
+        start_amplitude_db_hl=float(audiometry_cfg.get("start_amplitude_db_hl", 40.0)),
+        step_size_db=float(audiometry_cfg.get("step_size_db", 10.0)),
+        min_step_size_db=float(audiometry_cfg.get("min_step_size_db", 2.0)),
+        max_trials_per_frequency=int(audiometry_cfg.get("max_trials_per_frequency", 18)),
+        max_reversals=int(audiometry_cfg.get("max_reversals", 4)),
+        threshold_min_db_hl=float(bayes.get("threshold_min_db_hl", 0.0)),
+        threshold_max_db_hl=float(bayes.get("threshold_max_db_hl", 100.0)),
+        threshold_step_db=float(bayes.get("threshold_step_db", 2.0)),
+        psychometric_slope=float(bayes.get("psychometric_slope", 0.35)),
+        candidate_amplitudes_db_hl=[float(v) for v in bayes.get("candidate_amplitudes_db_hl", [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])],
+        variance_stop_threshold=float(bayes.get("variance_stop_threshold", 9.0)),
+        entropy_stop_threshold=float(bayes.get("entropy_stop_threshold", 1.4)),
+        min_trials_per_frequency=int(bayes.get("min_trials_per_frequency", 6)),
+    )
+
+
 def _find_debug_wav(cfg) -> Path:
     candidates = list((Path(cfg.paths.data_cache) / "LibriSpeech" / "dev-clean").rglob("*.flac"))
     if not candidates:
@@ -68,9 +91,10 @@ def run_hearing_test_cmd(
     simulated_audiogram: str = typer.Option("20,25,30,45,60,65,70,75", help="8 comma-separated dB HL thresholds"),
     seed: int = typer.Option(0, "--seed"),
     save_progress_path: str | None = typer.Option(None, "--save_progress_path"),
+    audiometry_mode: str = typer.Option("bayesian", "--audiometry_mode", help="bayesian or staircase"),
 ) -> None:
     cfg = _get_cfg(config)
-    engine_cfg = AudiometryEngineConfig(sample_rate=int(cfg.sample_rate))
+    engine_cfg = _build_audiometry_engine_cfg(cfg, estimator_mode=audiometry_mode)
     gt = parse_manual_audiogram(simulated_audiogram) if mode == "simulated" else None
     run_hearing_test(engine_cfg, mode=mode, ground_truth_audiogram=gt, seed=seed, save_progress_path=save_progress_path)
 
@@ -83,9 +107,10 @@ def estimate_profile(
     simulated_audiogram: str = typer.Option("20,25,30,45,60,65,70,75", help="8 comma-separated dB HL thresholds"),
     seed: int = typer.Option(0, "--seed"),
     notes: str = typer.Option("", "--notes"),
+    audiometry_mode: str = typer.Option("bayesian", "--audiometry_mode", help="bayesian or staircase"),
 ) -> None:
     cfg = _get_cfg(config)
-    engine_cfg = AudiometryEngineConfig(sample_rate=int(cfg.sample_rate))
+    engine_cfg = _build_audiometry_engine_cfg(cfg, estimator_mode=audiometry_mode)
     gt = parse_manual_audiogram(simulated_audiogram) if mode == "simulated" else None
     _, profile = run_hearing_test(engine_cfg, mode=mode, ground_truth_audiogram=gt, seed=seed)
     profile.notes = notes
@@ -197,6 +222,8 @@ def validate_audiometry(
     jitter_std: float = typer.Option(1.5, "--jitter_std"),
     seed: int = typer.Option(0, "--seed"),
     output_json: str = typer.Option("outputs/audiometry_validation_summary.json", "--output_json"),
+    audiometry_mode: str = typer.Option("bayesian", "--audiometry_mode", help="bayesian or staircase"),
+    include_staircase_baseline: bool = typer.Option(True, "--include_staircase_baseline"),
 ) -> None:
     cfg = _get_cfg(config)
     summary = run_validation_suite(
@@ -204,7 +231,8 @@ def validate_audiometry(
         slope=psychometric_slope,
         base_seed=seed,
         jitter_std=jitter_std,
-        engine_cfg=AudiometryEngineConfig(sample_rate=int(cfg.sample_rate)),
+        engine_cfg=_build_audiometry_engine_cfg(cfg, estimator_mode=audiometry_mode),
+        include_staircase_baseline=include_staircase_baseline,
     )
     saved = save_validation_summary(summary, output_json)
     print(f"Saved audiometry validation summary: {saved}")
@@ -220,7 +248,7 @@ def debug(config: str = "personalized_hearing_enhancement/configs/default.yaml")
     run_training(config, "conditioned", debug=True, overfit_single_batch=False, run_name=f"{cfg.debug.run_name}_conditioned")
     input_wav = _find_debug_wav(cfg)
     _, profile = run_hearing_test(
-        AudiometryEngineConfig(sample_rate=int(cfg.sample_rate)),
+        _build_audiometry_engine_cfg(cfg),
         mode="simulated",
         ground_truth_audiogram=[20, 25, 30, 45, 60, 65, 70, 75],
         seed=123,
